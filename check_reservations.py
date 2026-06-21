@@ -16,6 +16,7 @@ Usage
     pip install playwright requests
     playwright install chromium
     python3 check_reservations.py [--days 60] [--visible]
+    python3 check_reservations.py --start 2026-07-07 --end 2026-07-10
 """
 
 import argparse
@@ -43,7 +44,11 @@ AVAIL_PATTERNS = re.compile(
 def parse_args():
     p = argparse.ArgumentParser(description="Check Pizza Marumo reservations")
     p.add_argument("--days", type=int, default=60,
-                   help="Days ahead to check (default: 60)")
+                   help="Days ahead to check (default: 60, ignored if --start/--end given)")
+    p.add_argument("--start", type=str, default=None, metavar="YYYY-MM-DD",
+                   help="Start date (inclusive), e.g. 2026-07-07")
+    p.add_argument("--end", type=str, default=None, metavar="YYYY-MM-DD",
+                   help="End date (inclusive), e.g. 2026-07-10")
     p.add_argument("--visible", action="store_true",
                    help="Show browser window (default: headless)")
     p.add_argument("--output", default="reservations.json",
@@ -55,7 +60,7 @@ def parse_args():
 # Browser session
 # ---------------------------------------------------------------------------
 
-def run(days: int, headless: bool, output_path: str):
+def run(start: date, end: date, headless: bool, output_path: str):
     try:
         from playwright.sync_api import sync_playwright
         import requests as req
@@ -63,14 +68,13 @@ def run(days: int, headless: bool, output_path: str):
         print("Missing dependencies. Run:\n  pip install playwright requests && playwright install chromium")
         sys.exit(1)
 
-    today = date.today()
-    end = today + timedelta(days=days)
-
+    days = (end - start).days + 1
     print(f"Pizza Marumo — availability checker")
     print(f"  Guests   : {NUM_PEOPLE} adults, table service")
-    print(f"  Range    : {today} → {end}  ({days} days)")
+    print(f"  Range    : {start} → {end}  ({days} day(s))")
     print(f"  Headless : {headless}\n")
 
+    today = start  # alias so downstream code still works
     captured = {}   # url → response JSON
     headers_seen = {}  # url → request headers
 
@@ -149,7 +153,7 @@ def run(days: int, headless: bool, output_path: str):
         slots = _query_api_for_range(avail_url, hdrs, today, end, req)
     else:
         print("\n[warn] No API endpoint captured — falling back to browser calendar scan")
-        slots = _browser_calendar_scan(days, headless)
+        slots = _browser_calendar_scan(start, end, headless)
 
     # ---------------------------------------------------------------------- #
     # Output                                                                  #
@@ -161,7 +165,7 @@ def run(days: int, headless: bool, output_path: str):
         "shop": SHOP_SLUG,
         "num_people": NUM_PEOPLE,
         "seat_type": "table",
-        "range_start": str(today),
+        "range_start": str(start),
         "range_end": str(end),
         "slots": slots,
     }
@@ -387,12 +391,11 @@ def _looks_like_time(s: str) -> bool:
 # Fallback: full browser calendar scan
 # ---------------------------------------------------------------------------
 
-def _browser_calendar_scan(days: int, headless: bool) -> list:
+def _browser_calendar_scan(start: date, end: date, headless: bool) -> list:
     """Slower fallback: click every available date in the browser calendar."""
     from playwright.sync_api import sync_playwright
 
-    today = date.today()
-    end = today + timedelta(days=days)
+    today = start
     slots = []
 
     with sync_playwright() as p:
@@ -408,14 +411,14 @@ def _browser_calendar_scan(days: int, headless: bool) -> list:
         page.wait_for_timeout(1_500)
 
         months_done = set()
-        current_month = (today.year, today.month)
+        current_month = (start.year, start.month)
         target_month = (end.year, end.month)
 
         while current_month <= target_month:
             year, month = current_month
             if (year, month) not in months_done:
                 months_done.add((year, month))
-                cells = _available_cells_in_view(page, today, end)
+                cells = _available_cells_in_view(page, start, end)
                 print(f"  {year}-{month:02d}: {len(cells)} available dates")
 
                 for cell in cells:
@@ -544,8 +547,16 @@ def _print_results(slots: list):
 
 if __name__ == "__main__":
     args = parse_args()
+    today = date.today()
+    if args.start:
+        start = date.fromisoformat(args.start)
+        end = date.fromisoformat(args.end) if args.end else start
+    else:
+        start = today
+        end = today + timedelta(days=args.days)
     run(
-        days=args.days,
+        start=start,
+        end=end,
         headless=not args.visible,
         output_path=args.output,
     )
