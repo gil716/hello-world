@@ -1,0 +1,72 @@
+name: Check Reservations
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Start date (YYYY-MM-DD)"
+        required: true
+        default: "2026-07-07"
+      end_date:
+        description: "End date (YYYY-MM-DD)"
+        required: true
+        default: "2026-07-10"
+
+permissions:
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Chromium
+        run: playwright install --with-deps chromium
+
+      - name: Run availability check
+        run: |
+          python3 check_reservations.py \
+            --start "${{ inputs.start_date }}" \
+            --end   "${{ inputs.end_date }}" \
+            --comment-file comment.md
+
+      - name: Find or create tracking issue
+        id: issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NUM=$(gh issue list \
+            --search "Pizza Marumo Reservation Results in:title" \
+            --state open --json number --jq '.[0].number // empty')
+          if [ -z "$NUM" ]; then
+            NUM=$(gh issue create \
+              --title "🍕 Pizza Marumo — Reservation Results" \
+              --body "Availability check results are posted as comments below." \
+              --json number --jq '.number')
+            echo "Created tracking issue #$NUM"
+          else
+            echo "Using existing issue #$NUM"
+          fi
+          echo "number=$NUM" >> "$GITHUB_OUTPUT"
+
+      - name: Post comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment "${{ steps.issue.outputs.number }}" \
+            --body-file comment.md
