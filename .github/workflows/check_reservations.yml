@@ -57,11 +57,11 @@ jobs:
             --search "Pizza Marumo Reservation Results in:title" \
             --state open --json number --jq '.[0].number // empty')
           if [ -z "$NUM" ]; then
-            NUM=$(gh issue create \
+            URL=$(gh issue create \
               --repo "$REPO" \
               --title "Pizza Marumo - Reservation Results" \
-              --body "Availability check results are posted as comments below." \
-              --json number --jq '.number')
+              --body "Availability check results are posted as comments below.")
+            NUM=$(echo "$URL" | grep -o '[0-9]*$')
             echo "Created tracking issue #$NUM"
           else
             echo "Using existing issue #$NUM"
