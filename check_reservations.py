@@ -156,8 +156,8 @@ def run(start: date, end: date, headless: bool, output_path: str, comment_file: 
         print("\n[warn] No API endpoint captured — falling back to browser calendar scan")
         checked = _browser_calendar_scan(start, end, headless)
 
-    # Flatten to slots list for backwards-compat JSON output
-    slots = [{"date": d, "time": t} for d, times in checked.items() for t in times]
+    # Flatten available slots for backwards-compat JSON output
+    slots = [{"date": d, "time": t} for d, v in checked.items() for t in v["available"]]
 
     # ---------------------------------------------------------------------- #
     # Output                                                                  #
@@ -305,7 +305,7 @@ def _pick_avail_url(captured: dict) -> str | None:
 def _query_api_for_range(template_url: str, headers: dict, start: date, end: date, req) -> dict:
     """
     Replay the captured API call for every date in [start, end].
-    Returns dict[date_str -> list[time_str]]; empty list means checked but nothing available.
+    Returns dict[date_str -> {"all": [...], "available": [...]}].
     """
     parsed = urlparse(template_url)
     qs = parse_qs(parsed.query, keep_blank_values=True)
@@ -320,7 +320,7 @@ def _query_api_for_range(template_url: str, headers: dict, start: date, end: dat
         if date_key:
             break
 
-    checked: dict[str, list[str]] = {}
+    checked: dict[str, dict] = {}
     current = start
     while current <= end:
         ds = current.isoformat()
@@ -338,17 +338,15 @@ def _query_api_for_range(template_url: str, headers: dict, start: date, end: dat
             if resp.status_code == 200:
                 data = resp.json()
                 day_slots = _extract_slots_from_json(data, ds)
-                times = sorted(set(s["time"] for s in day_slots))
-                checked[ds] = times
-                if times:
-                    print(f"  {ds}: {', '.join(times)}")
-                else:
-                    print(f"  {ds}: –")
+                all_times = sorted(set(s["time"] for s in day_slots))
+                avail_times = sorted(set(s["time"] for s in day_slots if s["available"]))
+                checked[ds] = {"all": all_times, "available": avail_times}
+                print(f"  {ds}: checked {len(all_times)} slot(s) — {', '.join(avail_times) or '–'}")
             else:
-                checked[ds] = []
+                checked[ds] = {"all": [], "available": []}
                 print(f"  {ds}: HTTP {resp.status_code}")
         except Exception as e:
-            checked[ds] = []
+            checked[ds] = {"all": [], "available": []}
             print(f"  {ds}: error ({e})")
 
         current += timedelta(days=1)
@@ -358,12 +356,11 @@ def _query_api_for_range(template_url: str, headers: dict, start: date, end: dat
 
 
 def _extract_slots_from_json(data, date_str: str) -> list:
-    """Parse an API response into a list of {date, time} dicts."""
+    """Parse an API response into a list of {date, time, available} dicts."""
     results = []
     if not isinstance(data, dict):
         return results
 
-    # Common key names across TableCheck API versions
     for key in ("slots", "times", "availabilities", "merits", "schedules", "data", "results"):
         items = data.get(key)
         if not isinstance(items, list):
@@ -380,9 +377,8 @@ def _extract_slots_from_json(data, date_str: str) -> list:
             )
             if t and _looks_like_time(str(t)):
                 d = item.get("date") or item.get("day") or date_str
-                available = item.get("available", item.get("is_available", True))
-                if available:
-                    results.append({"date": str(d)[:10], "time": str(t)[:5]})
+                available = bool(item.get("available", item.get("is_available", True)))
+                results.append({"date": str(d)[:10], "time": str(t)[:5], "available": available})
         if results:
             return results
 
@@ -392,7 +388,8 @@ def _extract_slots_from_json(data, date_str: str) -> list:
         for item in nested[date_str]:
             t = item.get("time") or item.get("start_time", "")
             if t:
-                results.append({"date": date_str, "time": str(t)[:5]})
+                available = bool(item.get("available", item.get("is_available", True)))
+                results.append({"date": date_str, "time": str(t)[:5], "available": available})
 
     return results
 
@@ -442,12 +439,12 @@ def _browser_calendar_scan(start: date, end: date, headless: bool) -> dict:
                         cell["el"].click()
                         page.wait_for_timeout(2_000)
                         ts = _time_slots_from_page(page)
-                        print(f"{', '.join(ts)}" if ts else "–")
-                        checked[d_str] = sorted(set(ts))
+                        checked[d_str] = ts
+                        print(f"checked {len(ts['all'])} — avail: {', '.join(ts['available']) or '–'}")
                         page.go_back(wait_until="domcontentloaded")
                         page.wait_for_timeout(1_500)
                     except Exception as e:
-                        checked[d_str] = []
+                        checked[d_str] = {"all": [], "available": []}
                         print(f"err: {e}")
 
             # advance month
@@ -492,25 +489,34 @@ def _available_cells_in_view(page, start: date, end: date) -> list:
     return results
 
 
-def _time_slots_from_page(page) -> list:
-    selectors = [
-        '[class*="time"]:not([class*="disabled"]) button',
+def _time_slots_from_page(page) -> dict:
+    """Return {"all": [...], "available": [...]} of time slots visible on the page."""
+    all_selectors = [
+        '[class*="time"] button',
         'button[data-time]',
-        '[class*="slot"]:not(.disabled)',
-        '[class*="TimeSlot"]:not([class*="disabled"])',
+        '[class*="slot"]',
+        '[class*="TimeSlot"]',
     ]
-    for sel in selectors:
+    disabled_markers = ("disabled", "unavailable", "soldout", "full")
+
+    for sel in all_selectors:
         try:
-            times = []
+            all_times, avail_times = [], []
             for el in page.locator(sel).all():
                 txt = el.inner_text().strip()
-                if re.match(r'\d{1,2}:\d{2}', txt):
-                    times.append(txt)
-            if times:
-                return times
+                if not re.match(r'\d{1,2}:\d{2}', txt):
+                    continue
+                all_times.append(txt)
+                cls = (el.get_attribute("class") or "").lower()
+                aria = (el.get_attribute("aria-disabled") or "").lower()
+                is_disabled = any(m in cls for m in disabled_markers) or aria == "true" or not el.is_enabled()
+                if not is_disabled:
+                    avail_times.append(txt)
+            if all_times:
+                return {"all": sorted(set(all_times)), "available": sorted(set(avail_times))}
         except Exception:
             continue
-    return []
+    return {"all": [], "available": []}
 
 
 def _click_next_month(page):
@@ -533,21 +539,22 @@ def _click_next_month(page):
 # ---------------------------------------------------------------------------
 
 def _format_comment(checked: dict, start: date, end: date) -> str:
-    available = {d: t for d, t in checked.items() if t}
-    total = sum(len(t) for t in available.values())
+    total_avail = sum(len(v["available"]) for v in checked.values())
     lines = [f"## 🍕 {start} → {end} · {NUM_PEOPLE} adults, table service", ""]
 
     if not checked:
         lines.append("⚠️ No dates were checked.")
     else:
-        summary = f"✅ **{total} slot(s) available**" if total else "❌ **No availability found**"
+        summary = f"✅ **{total_avail} slot(s) available**" if total_avail else "❌ **No availability found**"
         lines.append(f"{summary} — {len(checked)} date(s) checked")
-        lines += ["", "| Date | Times |", "|------|-------|"]
+        lines += ["", "| Date | Checked | Available |", "|------|---------|-----------|"]
         for d in sorted(checked):
             dt = datetime.strptime(d, "%Y-%m-%d")
             label = dt.strftime("%a %-d %b")
-            times = " &nbsp;·&nbsp; ".join(checked[d]) if checked[d] else "—"
-            lines.append(f"| **{label}** | {times} |")
+            v = checked[d]
+            all_str = " · ".join(v["all"]) if v["all"] else "—"
+            avail_str = " · ".join(v["available"]) if v["available"] else "—"
+            lines.append(f"| **{label}** | {all_str} | {avail_str} |")
 
     lines += ["", f"*Checked {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}*"]
     return "\n".join(lines)
@@ -565,11 +572,13 @@ def _print_results(checked: dict):
     for d in sorted(checked):
         dt = datetime.strptime(d, "%Y-%m-%d")
         label = dt.strftime("%Y-%m-%d (%a)")
-        times = "  ".join(checked[d]) if checked[d] else "–"
-        print(f"  {label}  →  {times}")
+        v = checked[d]
+        all_str = "  ".join(v["all"]) if v["all"] else "–"
+        avail_str = "  ".join(v["available"]) if v["available"] else "–"
+        print(f"  {label}  checked: {all_str}  |  available: {avail_str}")
 
-    total = sum(len(t) for t in checked.values())
-    avail_days = sum(1 for t in checked.values() if t)
+    total = sum(len(v["available"]) for v in checked.values())
+    avail_days = sum(1 for v in checked.values() if v["available"])
     print(f"\n  {total} slot(s) across {avail_days}/{len(checked)} date(s)")
 
 
