@@ -53,6 +53,8 @@ def parse_args():
                    help="Show browser window (default: headless)")
     p.add_argument("--output", default="reservations.json",
                    help="JSON output file (default: reservations.json)")
+    p.add_argument("--comment-file", default=None, metavar="PATH",
+                   help="Write a GitHub-flavoured markdown comment to this file")
     return p.parse_args()
 
 
@@ -60,7 +62,7 @@ def parse_args():
 # Browser session
 # ---------------------------------------------------------------------------
 
-def run(start: date, end: date, headless: bool, output_path: str):
+def run(start: date, end: date, headless: bool, output_path: str, comment_file: str | None = None):
     try:
         from playwright.sync_api import sync_playwright
         import requests as req
@@ -172,6 +174,12 @@ def run(start: date, end: date, headless: bool, output_path: str):
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     print(f"\nSaved → {output_path}")
+
+    if comment_file:
+        body = _format_comment(slots, start, end)
+        with open(comment_file, "w", encoding="utf-8") as f:
+            f.write(body)
+        print(f"Comment → {comment_file}")
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +526,26 @@ def _click_next_month(page):
 # Output
 # ---------------------------------------------------------------------------
 
+def _format_comment(slots: list, start: date, end: date) -> str:
+    lines = [f"## 🍕 {start} → {end} · {NUM_PEOPLE} adults, table service", ""]
+    if not slots:
+        lines.append("❌ No available reservations found.")
+    else:
+        by_date: dict[str, list[str]] = {}
+        for s in slots:
+            by_date.setdefault(s["date"], []).append(s["time"])
+        total = sum(len(v) for v in by_date.values())
+        lines.append(f"✅ **{total} slot(s) across {len(by_date)} date(s)**")
+        lines += ["", "| Date | Times |", "|------|-------|"]
+        for d in sorted(by_date):
+            dt = datetime.strptime(d, "%Y-%m-%d")
+            label = dt.strftime("%a %-d %b")
+            times = " &nbsp;·&nbsp; ".join(sorted(set(by_date[d])))
+            lines.append(f"| **{label}** | {times} |")
+    lines += ["", f"*Checked {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}*"]
+    return "\n".join(lines)
+
+
 def _print_results(slots: list):
     print(f"\n{'='*52}")
     print(f"  RESULTS — {NUM_PEOPLE} adults, table service, Pizza Marumo")
@@ -559,4 +587,5 @@ if __name__ == "__main__":
         end=end,
         headless=not args.visible,
         output_path=args.output,
+        comment_file=args.comment_file,
     )
