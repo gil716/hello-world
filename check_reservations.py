@@ -141,17 +141,22 @@ def run(start: date, end: date, headless: bool, output_path: str,
             if debug:
                 page.screenshot(path=f"debug/{ds}_form_ready.png")
 
-            # Dump debug info for the first date so we can verify form state
+            # Always dump debug info for the first date before the time loop
             if current == start:
-                _write_debug_summary(page, ds)
+                _write_debug_summary(page, ds, note="before time loop (first date)")
 
             all_times: list[str] = []
             avail_times: list[str] = []
+            set_time_worked = False   # track whether _set_time ever returned True
 
             for t in ALL_TIMES:
                 # Set the time field
-                if not _set_time(page, t):
-                    continue        # time field not found — skip silently
+                ok = _set_time(page, t)
+                if not ok:
+                    if not set_time_worked:
+                        print(f"  ⚠ _set_time({t}) returned False")
+                    continue
+                set_time_worked = True
 
                 page.wait_for_timeout(300)
                 _select_category(page, "table")   # re-assert in case reset
@@ -179,6 +184,10 @@ def run(start: date, end: date, headless: bool, output_path: str,
                 else:
                     # "unknown" — time probably doesn't exist on the form, skip
                     pass
+
+            if not set_time_worked:
+                print(f"  ⚠ _set_time never succeeded — dumping debug info")
+                _write_debug_summary(page, ds, note="_set_time() returned False for every slot")
 
             checked[ds] = {
                 "all": sorted(set(all_times)),
@@ -356,34 +365,107 @@ def _accept_notice(page):
 
 
 def _set_time(page, t: str) -> bool:
-    """Fill the time stepper with value t (e.g. '17:00'). Returns True if found."""
-    for sel in [
-        'input[type="time"]',
-        'input[name*="time"]',
-        'input[name*="hour"]',
-        'input[name*="start"]',
-    ]:
+    """Set the time stepper to t (e.g. '17:00'). Returns True if the field was found."""
+    hour, minute = t.split(":")
+
+    # --- Attempt 1: native <input type="time"> ---
+    for sel in ['input[type="time"]', 'input[name*="time"]',
+                'input[name*="hour"]', 'input[name*="start"]']:
         try:
             el = page.locator(sel).first
-            if el.is_visible():
+            if el.is_visible(timeout=300):
                 el.fill(t)
-                el.dispatch_event("change")
                 el.dispatch_event("input")
+                el.dispatch_event("change")
                 return True
         except Exception:
-            continue
+            pass
 
-    # Fallback: try any <select> that has this time as an option
+    # --- Attempt 2: <select> fallback ---
     for sel in ['select[name*="time"]', 'select[name*="hour"]', 'select[name*="start"]']:
         try:
             el = page.locator(sel).first
-            if el.is_visible():
+            if el.is_visible(timeout=300):
                 el.select_option(value=t)
                 return True
         except Exception:
-            continue
+            pass
 
-    return False
+    # --- Attempt 3: Vue/React synthetic-event injection ---
+    found = page.evaluate(r"""(t) => {
+        const [hh, mm] = t.split(':');
+        // Find any input whose current value looks like a time,
+        // or whose type is 'time', or whose placeholder suggests time.
+        const inputs = Array.from(document.querySelectorAll('input'));
+        for (const inp of inputs) {
+            const isTime = inp.type === 'time'
+                || /\d{1,2}:\d{2}/.test(inp.value || '')
+                || /time|hour|start/i.test(inp.name + inp.id + inp.placeholder);
+            if (!isTime) continue;
+            try {
+                // React-style setter bypass
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                setter.call(inp, t);
+            } catch(e) { inp.value = t; }
+            inp.dispatchEvent(new Event('input',  {bubbles:true}));
+            inp.dispatchEvent(new Event('change', {bubbles:true}));
+            return true;
+        }
+        return false;
+    }""", t)
+    if found:
+        return True
+
+    # --- Attempt 4: click-based stepper navigation ---
+    # Find a displayed element that shows a time value, then use +/- arrows.
+    return _set_time_via_stepper(page, t)
+
+
+def _set_time_via_stepper(page, t: str) -> bool:
+    """Navigate a +/- stepper UI to reach target time t. Returns True if attempted."""
+    # Find any element visibly showing a time pattern
+    time_el = None
+    for el in page.locator("div, span, p, input").all():
+        try:
+            txt = (el.inner_text(timeout=100) or "").strip()
+            if re.match(r'^\d{1,2}:\d{2}$', txt):
+                time_el = el
+                break
+        except Exception:
+            pass
+
+    if time_el is None:
+        return False
+
+    # Parse current displayed time
+    try:
+        cur_txt = time_el.inner_text(timeout=500).strip()
+        cur_h, cur_m = map(int, cur_txt.split(":"))
+    except Exception:
+        return False
+
+    tgt_h, tgt_m = map(int, t.split(":"))
+    cur_mins = cur_h * 60 + cur_m
+    tgt_mins = tgt_h * 60 + tgt_m
+    clicks = (tgt_mins - cur_mins) // 30   # each click = 30-min step
+
+    if clicks == 0:
+        return True
+
+    # Look for an increment or decrement button near the time element
+    btn_sel = 'button:has-text("+"), button[aria-label*="increase"], button[aria-label*="next"], button[aria-label*="up"]'
+    dec_sel = 'button:has-text("-"), button[aria-label*="decrease"], button[aria-label*="prev"], button[aria-label*="down"]'
+
+    btn_locator = page.locator(btn_sel if clicks > 0 else dec_sel)
+    for _ in range(abs(clicks)):
+        try:
+            btn_locator.first.click()
+            page.wait_for_timeout(100)
+        except Exception:
+            break
+
+    return True
 
 
 def _click_select(page):
@@ -435,24 +517,23 @@ def _check_result(page) -> str:
 # Debug helpers
 # ---------------------------------------------------------------------------
 
-def _write_debug_summary(page, ds: str):
+def _write_debug_summary(page, ds: str, note: str = ""):
     """Write a comprehensive markdown summary of all interactive elements on the page."""
     Path("debug").mkdir(exist_ok=True)
-    lines = [f"**URL:** `{page.url}`", ""]
+    lines = [f"**URL:** `{page.url}`", f"**Note:** {note}" if note else "", ""]
 
-    # Run JS to collect every element with text or a value
+    # Full DOM scan via JS
     elements = page.evaluate("""() => {
         const results = [];
-        const all = document.querySelectorAll('*');
-        for (const el of all) {
-            const text = (el.innerText || el.textContent || '').trim().slice(0, 80);
+        for (const el of document.querySelectorAll('*')) {
+            const text = (el.innerText || el.textContent || '').trim().slice(0, 100);
             const val  = el.value !== undefined ? String(el.value) : '';
             if (!text && !val) continue;
             results.push({
                 tag:      el.tagName.toLowerCase(),
                 id:       el.id || '',
                 cls:      (el.className && typeof el.className === 'string')
-                              ? el.className.slice(0, 80) : '',
+                              ? el.className.slice(0, 100) : '',
                 role:     el.getAttribute('role') || '',
                 type:     el.getAttribute('type') || '',
                 name:     el.getAttribute('name') || '',
@@ -460,11 +541,20 @@ def _write_debug_summary(page, ds: str):
                 ariaDisabled: el.getAttribute('aria-disabled') || '',
                 dataDate: el.getAttribute('data-date') || '',
                 text:     text,
-                val:      val.slice(0, 40),
+                val:      val.slice(0, 60),
             });
         }
         return results;
     }""")
+
+    # Section 0: raw HTML of the form/main area
+    lines.append("### Page HTML (first 4000 chars of <body>)")
+    try:
+        html = page.evaluate("() => document.body.innerHTML.slice(0, 4000)")
+        lines.append(f"```html\n{html}\n```")
+    except Exception as exc:
+        lines.append(f"_(error: {exc})_")
+    lines.append("")
 
     # Section 1: anything whose text or value looks like a time
     time_els = [e for e in elements
@@ -478,35 +568,44 @@ def _write_debug_summary(page, ds: str):
             f"class=`{e['cls']}`  text=`{e['text']}`  val=`{e['val']}`"
         )
     if not time_els:
-        lines.append("_(none)_")
+        lines.append("_(none found)_")
     lines.append("")
 
     # Section 2: all <select> elements and their options
     lines.append("### Select elements")
+    found_sel = False
     for sel_el in page.locator("select").all():
         try:
             name = sel_el.get_attribute("name") or sel_el.get_attribute("id") or "?"
             opts = [(o.get_attribute("value") or "", o.inner_text().strip())
                     for o in sel_el.locator("option").all()]
             lines.append(f"- `{name}`: {opts[:30]}")
+            found_sel = True
         except Exception:
             continue
+    if not found_sel:
+        lines.append("_(none)_")
     lines.append("")
 
     # Section 3: all input elements
     lines.append("### Input elements")
+    found_inp = False
     for el in page.locator("input").all():
         try:
             name = el.get_attribute("name") or el.get_attribute("id") or "?"
             typ  = el.get_attribute("type") or "text"
             val  = el.input_value() or ""
             aria = el.get_attribute("aria-label") or ""
-            lines.append(f"- `{name}` type=`{typ}` value=`{val}` aria-label=`{aria}`")
+            cls  = (el.get_attribute("class") or "")[:80]
+            lines.append(f"- `{name}` type=`{typ}` value=`{val}` aria-label=`{aria}` class=`{cls}`")
+            found_inp = True
         except Exception:
             continue
+    if not found_inp:
+        lines.append("_(none)_")
     lines.append("")
 
-    # Section 4: elements with role=listbox/combobox/option/spinbutton
+    # Section 4: ARIA role elements
     roles = ["listbox", "combobox", "option", "spinbutton", "slider", "menu", "menuitem"]
     role_els = [e for e in elements if e['role'] in roles]
     lines.append(f"### ARIA role elements ({len(role_els)})")
@@ -523,15 +622,20 @@ def _write_debug_summary(page, ds: str):
     lines.append("### Buttons")
     for el in page.locator("button, [role='button']").all():
         try:
-            t   = el.inner_text(timeout=200).strip()
-            cls = (el.get_attribute("class") or "")[:80]
+            bt  = el.inner_text(timeout=200).strip()
+            cls = (el.get_attribute("class") or "")[:100]
             aria = el.get_attribute("aria-label") or ""
-            if t or aria:
-                lines.append(f"- text=`{t}` aria-label=`{aria}` class=`{cls}`")
+            if bt or aria:
+                lines.append(f"- text=`{bt}` aria-label=`{aria}` class=`{cls}`")
         except Exception:
             continue
 
-    Path(f"debug/{ds}_summary.md").write_text("\n".join(lines), encoding="utf-8")
+    content = "\n".join(lines)
+    Path(f"debug/{ds}_summary.md").write_text(content, encoding="utf-8")
+    # Also print first 2000 chars to stdout so it appears in the Actions log
+    print(f"\n--- DEBUG SUMMARY {ds} ---")
+    print(content[:2000])
+    print("--- END DEBUG SUMMARY ---\n")
 
 
 # ---------------------------------------------------------------------------
