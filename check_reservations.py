@@ -138,9 +138,10 @@ def run(start: date, end: date, headless: bool, output_path: str,
             times = _get_time_options(page)
             print(f"  Time options: {times or '(none found)'}")
 
+            # Always dump debug summary (overwritten each date; last one posted)
+            _write_debug_summary(page, ds)
+
             if not times:
-                # Dump debug info so we can fix selectors
-                _write_debug_summary(page, ds)
                 checked[ds] = {"all": [], "available": []}
                 current += timedelta(days=1)
                 continue
@@ -437,41 +438,98 @@ def _slot_available(page) -> bool:
 # ---------------------------------------------------------------------------
 
 def _write_debug_summary(page, ds: str):
-    """Write a markdown summary of the page DOM to debug/<ds>_summary.md."""
+    """Write a comprehensive markdown summary of all interactive elements on the page."""
     Path("debug").mkdir(exist_ok=True)
     lines = [f"**URL:** `{page.url}`", ""]
 
-    # All select elements and their options
-    lines.append("**Select elements:**")
-    for i, sel_el in enumerate(page.locator("select").all()):
+    # Run JS to collect every element with text or a value
+    elements = page.evaluate("""() => {
+        const results = [];
+        const all = document.querySelectorAll('*');
+        for (const el of all) {
+            const text = (el.innerText || el.textContent || '').trim().slice(0, 80);
+            const val  = el.value !== undefined ? String(el.value) : '';
+            if (!text && !val) continue;
+            results.push({
+                tag:      el.tagName.toLowerCase(),
+                id:       el.id || '',
+                cls:      (el.className && typeof el.className === 'string')
+                              ? el.className.slice(0, 80) : '',
+                role:     el.getAttribute('role') || '',
+                type:     el.getAttribute('type') || '',
+                name:     el.getAttribute('name') || '',
+                ariaLabel: el.getAttribute('aria-label') || '',
+                ariaDisabled: el.getAttribute('aria-disabled') || '',
+                dataDate: el.getAttribute('data-date') || '',
+                text:     text,
+                val:      val.slice(0, 40),
+            });
+        }
+        return results;
+    }""")
+
+    # Section 1: anything whose text or value looks like a time
+    time_els = [e for e in elements
+                if re.search(r'\b\d{1,2}:\d{2}\b', e['text'] + ' ' + e['val'])]
+    lines.append(f"### Elements containing a time value ({len(time_els)})")
+    for e in time_els:
+        lines.append(
+            f"- `<{e['tag']}>` id=`{e['id']}` name=`{e['name']}` "
+            f"type=`{e['type']}` role=`{e['role']}` "
+            f"aria-label=`{e['ariaLabel']}` aria-disabled=`{e['ariaDisabled']}`  "
+            f"class=`{e['cls']}`  text=`{e['text']}`  val=`{e['val']}`"
+        )
+    if not time_els:
+        lines.append("_(none)_")
+    lines.append("")
+
+    # Section 2: all <select> elements and their options
+    lines.append("### Select elements")
+    for sel_el in page.locator("select").all():
         try:
-            name = sel_el.get_attribute("name") or sel_el.get_attribute("id") or f"#{i}"
-            opts = [o.get_attribute("value") or o.inner_text() for o in sel_el.locator("option").all()]
-            lines.append(f"- `{name}`: {opts[:20]}")
+            name = sel_el.get_attribute("name") or sel_el.get_attribute("id") or "?"
+            opts = [(o.get_attribute("value") or "", o.inner_text().strip())
+                    for o in sel_el.locator("option").all()]
+            lines.append(f"- `{name}`: {opts[:30]}")
         except Exception:
             continue
     lines.append("")
 
-    # All buttons
-    lines.append("**Buttons:**")
-    for el in page.locator("button, [role='button']").all():
-        try:
-            t = el.inner_text(timeout=200).strip()
-            cls = (el.get_attribute("class") or "")[:60]
-            if t:
-                lines.append(f"- `{t}` (class: `{cls}`)")
-        except Exception:
-            continue
-    lines.append("")
-
-    # All inputs
-    lines.append("**Inputs:**")
+    # Section 3: all input elements
+    lines.append("### Input elements")
     for el in page.locator("input").all():
         try:
             name = el.get_attribute("name") or el.get_attribute("id") or "?"
-            typ = el.get_attribute("type") or "text"
-            val = el.input_value() or ""
-            lines.append(f"- `{name}` type=`{typ}` value=`{val}`")
+            typ  = el.get_attribute("type") or "text"
+            val  = el.input_value() or ""
+            aria = el.get_attribute("aria-label") or ""
+            lines.append(f"- `{name}` type=`{typ}` value=`{val}` aria-label=`{aria}`")
+        except Exception:
+            continue
+    lines.append("")
+
+    # Section 4: elements with role=listbox/combobox/option/spinbutton
+    roles = ["listbox", "combobox", "option", "spinbutton", "slider", "menu", "menuitem"]
+    role_els = [e for e in elements if e['role'] in roles]
+    lines.append(f"### ARIA role elements ({len(role_els)})")
+    for e in role_els:
+        lines.append(
+            f"- role=`{e['role']}` `<{e['tag']}>` id=`{e['id']}` "
+            f"class=`{e['cls']}`  text=`{e['text']}`"
+        )
+    if not role_els:
+        lines.append("_(none)_")
+    lines.append("")
+
+    # Section 5: all buttons
+    lines.append("### Buttons")
+    for el in page.locator("button, [role='button']").all():
+        try:
+            t   = el.inner_text(timeout=200).strip()
+            cls = (el.get_attribute("class") or "")[:80]
+            aria = el.get_attribute("aria-label") or ""
+            if t or aria:
+                lines.append(f"- text=`{t}` aria-label=`{aria}` class=`{cls}`")
         except Exception:
             continue
 
