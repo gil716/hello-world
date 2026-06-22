@@ -174,6 +174,10 @@ def run(start: date, end: date, headless: bool, output_path: str,
             print(f"{len(slots)} slot(s) found")
 
             if not slots:
+                summary = _debug_summary(page)
+                # Always write debug summary when no slots found (used by workflow)
+                Path("debug").mkdir(exist_ok=True)
+                Path(f"debug/{ds}_no_slots_summary.md").write_text(summary, encoding="utf-8")
                 if debug:
                     _dump_html(page, f"debug/{ds}_no_slots.html")
                 checked[ds] = {"all": [], "available": []}
@@ -528,6 +532,67 @@ def _dump_html(page, path: str):
         Path(path).write_text(page.content(), encoding="utf-8")
     except Exception:
         pass
+
+
+def _debug_summary(page) -> str:
+    """Extract DOM info useful for fixing selectors — no full HTML needed."""
+    lines = []
+
+    # Current URL
+    lines.append(f"**URL:** `{page.url}`")
+    lines.append("")
+
+    # All button texts
+    btn_texts = []
+    for el in page.locator("button, [role='button']").all():
+        try:
+            t = el.inner_text(timeout=300).strip()
+            if t:
+                cls = (el.get_attribute("class") or "")[:60]
+                btn_texts.append(f"`{t}` (class: `{cls}`)")
+        except Exception:
+            continue
+    lines.append(f"**Buttons ({len(btn_texts)}):**")
+    lines += btn_texts[:40] or ["(none)"]
+    lines.append("")
+
+    # Any element whose text looks like a time
+    time_els = []
+    for tag in ["button", "a", "li", "div", "span", "td", "p"]:
+        for el in page.locator(tag).all():
+            try:
+                t = el.inner_text(timeout=200).strip()
+                if re.match(r'^\d{1,2}:\d{2}$', t):
+                    cls = (el.get_attribute("class") or "")[:80]
+                    aria = el.get_attribute("aria-disabled") or ""
+                    enabled = el.is_enabled()
+                    time_els.append(
+                        f"`<{tag}>` `{t}` — class: `{cls}` aria-disabled: `{aria}` enabled: `{enabled}`"
+                    )
+            except Exception:
+                continue
+    lines.append(f"**Time-like elements ({len(time_els)}):**")
+    lines += time_els[:30] or ["(none found — time slots may not be on this page yet)"]
+    lines.append("")
+
+    # Unique class name fragments (helps identify component names)
+    classes = set()
+    for el in page.locator("[class]").all():
+        try:
+            for c in (el.get_attribute("class") or "").split():
+                if len(c) > 3:
+                    classes.add(c[:50])
+        except Exception:
+            continue
+    interesting = sorted(c for c in classes
+                         if any(kw in c.lower() for kw in
+                                ("time", "slot", "hour", "schedule", "seat",
+                                 "frame", "panel", "list", "item", "block",
+                                 "reserve", "book", "avail", "step")))
+    lines.append(f"**Relevant CSS classes:**")
+    lines += [f"`{c}`" for c in interesting[:30]] or ["(none)"]
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

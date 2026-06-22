@@ -47,13 +47,6 @@ jobs:
             --comment-file comment.md \
             --debug-screenshots
 
-      - name: Upload debug screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-screenshots
-          path: debug/
-          if-no-files-found: ignore
 
       - name: Find or create tracking issue
         id: issue
@@ -77,10 +70,35 @@ jobs:
           fi
           echo "number=$NUM" >> "$GITHUB_OUTPUT"
 
-      - name: Post comment
+      - name: Post results comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh issue comment "${{ steps.issue.outputs.number }}" \
             --repo "${{ github.repository }}" \
             --body-file comment.md
+
+      - name: Post debug info if no times found
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Combine all debug summaries into one comment if any exist
+          SUMMARIES=$(ls debug/*_no_slots_summary.md 2>/dev/null || true)
+          if [ -n "$SUMMARIES" ]; then
+            {
+              echo "## 🔍 Debug — no time slots found on these dates"
+              echo ""
+              for f in $SUMMARIES; do
+                DATE=$(basename "$f" _no_slots_summary.md)
+                echo "### $DATE"
+                echo ""
+                cat "$f"
+                echo ""
+                echo "---"
+                echo ""
+              done
+            } > debug_comment.md
+            gh issue comment "${{ steps.issue.outputs.number }}" \
+              --repo "${{ github.repository }}" \
+              --body-file debug_comment.md
+          fi
