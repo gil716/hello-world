@@ -147,7 +147,7 @@ def run(start: date, end: date, headless: bool, output_path: str,
                 print(f"  trying {time_label} (epoch={epoch_val})")
                 # Set time
                 try:
-                    page.locator(_TIME_SELECT).select_option(value=epoch_val)
+                    page.locator(_TIME_SELECT).select_option(value=epoch_val, timeout=5_000)
                 except Exception as e:
                     print(f"  ⚠ could not select time {time_label}: {e}")
                     continue
@@ -172,10 +172,15 @@ def run(start: date, end: date, headless: bool, output_path: str,
                 if result == "available":
                     avail_times.append(time_label)
                     print(f"  {time_label}: ✓ available")
-                    # Go back and restore form state
-                    page.go_back(wait_until="domcontentloaded", timeout=15_000)
-                    page.wait_for_timeout(2_000)
-                    # Re-set adults in case form reset
+                    # Reload form fresh so remaining slots can be checked
+                    page.goto(RESERVE_URL, wait_until="domcontentloaded", timeout=30_000)
+                    page.wait_for_timeout(3_000)
+                    _accept_notice(page)
+                    page.wait_for_timeout(500)
+                    if not _set_date(page, current):
+                        print("  ⚠ could not re-set date after available result — stopping date")
+                        break
+                    page.wait_for_timeout(1_500)
                     _set_adults(page)
                 elif result == "unavailable":
                     print(f"  {time_label}: ✗ not available")
