@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """
 TableCheck reservation availability checker for Pizza Marumo.
-Checks all time slots for 4 adults, table service.
 
-Form flow (as seen on the actual page)
----------------------------------------
-1. A "Notice from the Store" checkbox must be ticked first.
-2. The form has: date stepper, time stepper, adults select, category buttons.
-3. Click the green Select button.
-4. If the page advances → available; orange error → not available.
+Form structure (discovered via debug dump):
+  - Checkbox:  input[name="reservation_confirm_shop_note"]
+  - Date:      input[name="reservation[start_date]"]  ← Mobiscroll picker
+  - Time:      select[name="reservation[start_at_epoch]"] ← AJAX-populated after date set
+  - Adults:    select[name="reservation[num_people_adult]"]
+  - Category:  input[name="reservation[service_category]"] (radio, 3 options)
+  - Submit:    input[name="commit"]  value="確定画面へ"
 
-For each date we try every 30-minute slot 11:00–21:00.
+Flow:
+  1. Tick checkbox
+  2. Set date via Mobiscroll (jQuery API or calendar click)
+  3. Wait for time <select> to populate (AJAX fires on date change)
+  4. For each time option: select it, set adults+category, click submit
+  5. Unavailable → orange error, still on form; Available → new page
 
-Usage
------
-    pip install playwright
-    playwright install chromium
-    python3 check_reservations.py --start 2026-07-07 --end 2026-07-10 [--visible]
+Usage:
+    pip install playwright && playwright install chromium
+    python3 check_reservations.py --start 2026-07-07 --end 2026-07-10
 """
 
 import argparse
@@ -27,23 +30,24 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 NUM_PEOPLE = 4
-SHOP_SLUG = "pizza-marumo"
+SHOP_SLUG  = "pizza-marumo"
 RESERVE_URL = f"https://www.tablecheck.com/ja/shops/{SHOP_SLUG}/reserve"
 
-# All 30-minute slots to try (restaurant open lunch + dinner)
-ALL_TIMES = [
-    f"{h:02d}:{m:02d}"
-    for h in range(11, 22)
-    for m in (0, 30)
-]
+# Exact selectors from the live DOM
+_NOTICE_CB   = 'input[name="reservation_confirm_shop_note"]'
+_DATE_INPUT  = 'input[name="reservation[start_date]"]'
+_TIME_SELECT = 'select[name="reservation[start_at_epoch]"]'
+_ADULTS_SEL  = 'select[name="reservation[num_people_adult]"]'
+_CAT_RADIO   = 'input[name="reservation[service_category]"]:not([type="hidden"])'
+_SUBMIT      = 'input[name="commit"]'
 
-# Error text shown when a slot is unavailable
 UNAVAIL_TEXT = [
     "Reservations are not available in the category",
     "ご選択のカテゴリー",
     "満席",
     "Please select a different category",
     "not available",
+    "ご希望の時間帯",
 ]
 
 
@@ -53,9 +57,9 @@ UNAVAIL_TEXT = [
 
 def parse_args():
     p = argparse.ArgumentParser(description="Check Pizza Marumo reservations")
-    p.add_argument("--start", required=True, metavar="YYYY-MM-DD")
-    p.add_argument("--end",   required=True, metavar="YYYY-MM-DD")
-    p.add_argument("--visible", action="store_true", help="Show browser window")
+    p.add_argument("--start",  required=True, metavar="YYYY-MM-DD")
+    p.add_argument("--end",    required=True, metavar="YYYY-MM-DD")
+    p.add_argument("--visible", action="store_true")
     p.add_argument("--output", default="reservations.json")
     p.add_argument("--comment-file", default=None, metavar="PATH")
     p.add_argument("--debug-screenshots", action="store_true")
@@ -84,11 +88,11 @@ def run(start: date, end: date, headless: bool, output_path: str,
 
     checked: dict[str, dict] = {}
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=headless)
         ctx = browser.new_context(
             locale="ja-JP",
-            viewport={"width": 390, "height": 844},   # iPhone-sized so mobile layout loads
+            viewport={"width": 390, "height": 844},
             user_agent=(
                 "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
                 "AppleWebKit/605.1.15 (KHTML, like Gecko) "
@@ -97,100 +101,89 @@ def run(start: date, end: date, headless: bool, output_path: str,
         )
         page = ctx.new_page()
 
-        print(f"→ {RESERVE_URL}")
-        page.goto(RESERVE_URL, wait_until="domcontentloaded", timeout=30_000)
-        page.wait_for_timeout(3_000)
-
-        if debug:
-            page.screenshot(path="debug/01_loaded.png")
-
-        # ------------------------------------------------------------------
-        # Walk each date
-        # ------------------------------------------------------------------
         current = start
         while current <= end:
             ds = current.isoformat()
             print(f"\n{ds}")
 
-            # Fresh page load for each date
             page.goto(RESERVE_URL, wait_until="domcontentloaded", timeout=30_000)
             page.wait_for_timeout(3_000)
 
-            # 1. Tick the "Notice from the Store" agreement checkbox
+            if debug:
+                page.screenshot(path=f"debug/{ds}_01_loaded.png")
+
+            # 1. Tick the notice checkbox
             _accept_notice(page)
             page.wait_for_timeout(500)
 
-            # 2. Set date
+            # 2. Set date and wait for time options to load
             if not _set_date(page, current):
-                print("  ⚠ could not set date — dumping debug info")
-                _write_debug_summary(page, ds)
+                print("  ✗ could not set date")
+                _write_debug_summary(page, ds, "_set_date() failed")
                 checked[ds] = {"all": [], "available": []}
                 current += timedelta(days=1)
                 continue
 
-            page.wait_for_timeout(800)
-
-            # 3. Set adults = 4
-            _set_adults(page, NUM_PEOPLE)
-            page.wait_for_timeout(500)
-
-            # 4. Select "table" category
-            _select_category(page, "table")
-            page.wait_for_timeout(500)
-
             if debug:
-                page.screenshot(path=f"debug/{ds}_form_ready.png")
+                page.screenshot(path=f"debug/{ds}_02_date_set.png")
 
-            # Always dump debug info for the first date before the time loop
-            if current == start:
-                _write_debug_summary(page, ds, note="before time loop (first date)")
+            # 3. Collect time options (populated by AJAX after date set)
+            time_opts = _get_time_options(page)
+            print(f"  {len(time_opts)} time option(s): {[t for _, t in time_opts]}")
 
-            all_times: list[str] = []
+            if not time_opts:
+                _write_debug_summary(page, ds, "no time options after date set")
+                checked[ds] = {"all": [], "available": []}
+                current += timedelta(days=1)
+                continue
+
+            # 4. Set adults (stays constant across all time trials)
+            _set_adults(page)
+
+            all_times:   list[str] = []
             avail_times: list[str] = []
-            set_time_worked = False   # track whether _set_time ever returned True
 
-            for t in ALL_TIMES:
-                # Set the time field
-                ok = _set_time(page, t)
-                if not ok:
-                    if not set_time_worked:
-                        print(f"  ⚠ _set_time({t}) returned False")
+            for epoch_val, time_label in time_opts:
+                # Set time
+                try:
+                    page.locator(_TIME_SELECT).select_option(value=epoch_val)
+                except Exception as e:
+                    print(f"  ⚠ could not select time {time_label}: {e}")
                     continue
-                set_time_worked = True
 
                 page.wait_for_timeout(300)
-                _select_category(page, "table")   # re-assert in case reset
+
+                # Set category = table (first radio = テーブル)
+                _select_table_category(page)
                 page.wait_for_timeout(200)
 
-                _click_select(page)
+                # Submit
+                _click_submit(page)
                 page.wait_for_timeout(2_000)
 
                 if debug:
-                    page.screenshot(path=f"debug/{ds}_{t.replace(':', '')}.png")
+                    page.screenshot(path=f"debug/{ds}_{time_label.replace(':', '')}.png")
 
                 result = _check_result(page)
+                all_times.append(time_label)
 
                 if result == "available":
-                    all_times.append(t)
-                    avail_times.append(t)
-                    print(f"  {t}: ✓ available")
-                    page.go_back(wait_until="domcontentloaded", timeout=10_000)
-                    page.wait_for_timeout(1_500)
-                    _select_category(page, "table")
+                    avail_times.append(time_label)
+                    print(f"  {time_label}: ✓ available")
+                    # Go back and restore form state
+                    page.go_back(wait_until="domcontentloaded", timeout=15_000)
+                    page.wait_for_timeout(2_000)
+                    # Re-set adults in case form reset
+                    _set_adults(page)
                 elif result == "unavailable":
-                    all_times.append(t)
-                    print(f"  {t}: ✗ not available")
-                    # Still on form — try next time
+                    print(f"  {time_label}: ✗ not available")
                 else:
-                    # "unknown" — time probably doesn't exist on the form, skip
-                    pass
-
-            if not set_time_worked:
-                print(f"  ⚠ _set_time never succeeded — dumping debug info")
-                _write_debug_summary(page, ds, note="_set_time() returned False for every slot")
+                    print(f"  {time_label}: ? unknown result (url={page.url[:60]})")
+                    if debug:
+                        page.screenshot(path=f"debug/{ds}_{time_label.replace(':', '')}_unknown.png")
 
             checked[ds] = {
-                "all": sorted(set(all_times)),
+                "all":       sorted(set(all_times)),
                 "available": sorted(set(avail_times)),
             }
             current += timedelta(days=1)
@@ -210,14 +203,14 @@ def run(start: date, end: date, headless: bool, output_path: str,
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump({
-            "checked_at": datetime.now().isoformat(),
-            "shop": SHOP_SLUG,
-            "num_people": NUM_PEOPLE,
-            "seat_type": "table",
+            "checked_at":  datetime.now().isoformat(),
+            "shop":        SHOP_SLUG,
+            "num_people":  NUM_PEOPLE,
+            "seat_type":   "table",
             "range_start": str(start),
-            "range_end": str(end),
-            "checked": checked,
-            "slots": slots_flat,
+            "range_end":   str(end),
+            "checked":     checked,
+            "slots":       slots_flat,
         }, f, ensure_ascii=False, indent=2)
     print(f"\nSaved → {output_path}")
 
@@ -231,246 +224,181 @@ def run(start: date, end: date, headless: bool, output_path: str,
 # Form helpers
 # ---------------------------------------------------------------------------
 
+def _accept_notice(page):
+    """Tick the store-notice agreement checkbox."""
+    try:
+        cb = page.locator(_NOTICE_CB).first
+        if cb.is_visible(timeout=2_000) and not cb.is_checked():
+            cb.click()
+            page.wait_for_timeout(300)
+            print("  ✓ notice checkbox ticked")
+        elif cb.is_checked():
+            print("  ✓ notice checkbox already ticked")
+    except Exception as e:
+        print(f"  ⚠ _accept_notice: {e}")
+
+
 def _set_date(page, d: date) -> bool:
-    """Set the date field to d. Returns True if successful."""
-    ds = d.isoformat()
+    """
+    Set the Mobiscroll date picker to d.
+    Returns True when the time <select> subsequently gets populated (AJAX success).
+    """
+    ds_slash = f"{d.year}/{d.month:02d}/{d.day:02d}"  # Mobiscroll default format
 
-    # Try native date input
-    for sel in ['input[type="date"]', 'input[name*="date"]', 'input[name*="Date"]']:
-        try:
-            el = page.locator(sel).first
-            if el.is_visible():
-                el.fill(ds)
-                page.wait_for_timeout(300)
-                return True
-        except Exception:
-            continue
+    # --- Attempt 1: jQuery Mobiscroll API ---
+    method = page.evaluate(f"""() => {{
+        const el = document.querySelector('{_DATE_INPUT}');
+        if (!el) return 'not-found';
+        const dt = new Date({d.year}, {d.month - 1}, {d.day});
+        if (window.$ && $.fn && $.fn.mobiscroll) {{
+            try {{
+                $(el).mobiscroll('setVal', dt, true);
+                return 'mbsc-jquery';
+            }} catch(e) {{ }}
+        }}
+        // Try setting the string value + jQuery trigger
+        el.value = '{ds_slash}';
+        if (window.$) {{
+            $(el).trigger('change');
+            return 'jquery-trigger';
+        }}
+        el.dispatchEvent(new Event('change', {{bubbles: true}}));
+        el.dispatchEvent(new Event('input',  {{bubbles: true}}));
+        return 'manual-event';
+    }}""")
+    print(f"  _set_date method={method}")
+    page.wait_for_timeout(2_000)
 
-    # Try clicking a displayed date value and changing it
-    for sel in [f'[value="{ds}"]', f'text="{ds}"', '[data-field="date"]']:
-        try:
-            el = page.locator(sel).first
-            if el.is_visible():
-                el.click()
-                page.wait_for_timeout(500)
-                # If a date picker opened, we're done for now — the page might
-                # default to the right date; treat as success if date appears
-                return True
-        except Exception:
-            continue
-
-    # Try <select> for date parts
-    try:
-        page.locator(f'select[name*="year"] option[value="{d.year}"]').first.click()
-        page.locator(f'select[name*="month"] option[value="{d.month}"]').first.click()
-        page.locator(f'select[name*="day"] option[value="{d.day}"]').first.click()
+    if _time_options_loaded(page):
         return True
-    except Exception:
-        pass
 
-    # Last resort: look for a visible field showing a date and use fill
+    # --- Attempt 2: Click calendar UI and navigate ---
+    return _set_date_via_calendar(page, d)
+
+
+def _set_date_via_calendar(page, d: date) -> bool:
+    """Open Mobiscroll calendar, navigate to month, click day."""
     try:
-        for el in page.locator("input").all():
-            val = el.input_value()
-            if re.match(r'\d{4}-\d{2}-\d{2}', val or ""):
-                el.fill(ds)
-                return True
-    except Exception:
-        pass
+        page.locator(_DATE_INPUT).click(timeout=3_000)
+        page.wait_for_timeout(1_200)
 
-    return False
+        # Navigate forward from today's month to d's month
+        today = date.today()
+        months = (d.year - today.year) * 12 + (d.month - today.month)
+        for _ in range(months):
+            for sel in ['.mbsc-cal-next', '.mbsc-fr-arr-r', '.mbsc-calendar-next',
+                        'button[aria-label*="next"]', 'button[aria-label*="次"]',
+                        'button:has-text("›")', 'button:has-text(">")']:
+                try:
+                    btn = page.locator(sel).first
+                    if btn.is_visible(timeout=400):
+                        btn.click()
+                        page.wait_for_timeout(400)
+                        break
+                except Exception:
+                    continue
 
-
-def _set_adults(page, count: int):
-    """Set the adults/people count field."""
-    # Try select
-    for sel in ['select[name*="adult"]', 'select[name*="people"]',
-                'select[name*="num"]', 'select[name*="guest"]',
-                'select[name*="person"]']:
-        try:
-            el = page.locator(sel).first
-            if el.is_visible():
-                el.select_option(str(count))
-                return
-        except Exception:
-            continue
-
-    # Try stepper: find a field near a person icon that contains a number
-    for sel in ['input[name*="adult"]', 'input[name*="num"]']:
-        try:
-            el = page.locator(sel).first
-            if el.is_visible():
-                el.fill(str(count))
-                return
-        except Exception:
-            continue
-
-    # Try visible select that currently shows a number
-    for sel_el in page.locator("select").all():
-        try:
-            opts = [o.get_attribute("value") for o in sel_el.locator("option").all()]
-            if str(count) in opts and sel_el.is_visible():
-                sel_el.select_option(str(count))
-                return
-        except Exception:
-            continue
-
-
-def _select_category(page, category: str):
-    """Click the table/counter/private room category button."""
-    keywords = {
-        "table": ["table", "テーブル"],
-        "counter": ["counter", "カウンター"],
-        "private": ["private", "個室"],
-    }.get(category, [category])
-
-    for kw in keywords:
-        for locator in [
-            page.get_by_text(kw, exact=True),
-            page.get_by_text(kw, exact=False),
-            page.locator(f'button:has-text("{kw}")'),
-            page.locator(f'[value="{kw}"]'),
+        # Click on the day cell
+        day_str = str(d.day)
+        for sel in [
+            f'[data-val*="{d.isoformat()}"]',
+            f'[data-date="{d.isoformat()}"]',
+            '.mbsc-cal-day-i',
+            '.mbsc-calendar-day-text',
         ]:
             try:
-                el = locator.first
-                if el.is_visible():
-                    el.click()
-                    return
+                if 'data-' in sel:
+                    el = page.locator(sel).first
+                    if el.is_visible(timeout=400):
+                        el.click()
+                        page.wait_for_timeout(500)
+                        break
+                else:
+                    for el in page.locator(sel).all():
+                        if el.inner_text(timeout=100).strip() == day_str and el.is_visible():
+                            el.click()
+                            page.wait_for_timeout(500)
+                            break
             except Exception:
                 continue
 
+        # Confirm/close
+        for kw in ['Set', 'OK', '決定', '閉じる']:
+            try:
+                btn = page.get_by_text(kw, exact=True).first
+                if btn.is_visible(timeout=400):
+                    btn.click()
+                    page.wait_for_timeout(500)
+                    break
+            except Exception:
+                continue
 
-def _accept_notice(page):
-    """Tick the 'Notice from the Store' agreement checkbox."""
-    for sel in [
-        'input[type="checkbox"]',
-        '[role="checkbox"]',
-        'label:has-text("agree")',
-        'label:has-text("同意")',
-        'label:has-text("注意")',
-    ]:
-        try:
-            el = page.locator(sel).first
-            if el.is_visible():
-                try:
-                    if el.is_checked():
-                        return   # already ticked
-                except Exception:
-                    pass
-                el.click()
-                page.wait_for_timeout(300)
-                return
-        except Exception:
-            continue
+        page.wait_for_timeout(1_500)
+        return _time_options_loaded(page)
 
-
-def _set_time(page, t: str) -> bool:
-    """Set the time stepper to t (e.g. '17:00'). Returns True if the field was found."""
-    hour, minute = t.split(":")
-
-    # --- Attempt 1: native <input type="time"> ---
-    for sel in ['input[type="time"]', 'input[name*="time"]',
-                'input[name*="hour"]', 'input[name*="start"]']:
-        try:
-            el = page.locator(sel).first
-            if el.is_visible(timeout=300):
-                el.fill(t)
-                el.dispatch_event("input")
-                el.dispatch_event("change")
-                return True
-        except Exception:
-            pass
-
-    # --- Attempt 2: <select> fallback ---
-    for sel in ['select[name*="time"]', 'select[name*="hour"]', 'select[name*="start"]']:
-        try:
-            el = page.locator(sel).first
-            if el.is_visible(timeout=300):
-                el.select_option(value=t)
-                return True
-        except Exception:
-            pass
-
-    # --- Attempt 3: Vue/React synthetic-event injection ---
-    found = page.evaluate(r"""(t) => {
-        const [hh, mm] = t.split(':');
-        // Find any input whose current value looks like a time,
-        // or whose type is 'time', or whose placeholder suggests time.
-        const inputs = Array.from(document.querySelectorAll('input'));
-        for (const inp of inputs) {
-            const isTime = inp.type === 'time'
-                || /\d{1,2}:\d{2}/.test(inp.value || '')
-                || /time|hour|start/i.test(inp.name + inp.id + inp.placeholder);
-            if (!isTime) continue;
-            try {
-                // React-style setter bypass
-                const setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value').set;
-                setter.call(inp, t);
-            } catch(e) { inp.value = t; }
-            inp.dispatchEvent(new Event('input',  {bubbles:true}));
-            inp.dispatchEvent(new Event('change', {bubbles:true}));
-            return true;
-        }
-        return false;
-    }""", t)
-    if found:
-        return True
-
-    # --- Attempt 4: click-based stepper navigation ---
-    # Find a displayed element that shows a time value, then use +/- arrows.
-    return _set_time_via_stepper(page, t)
-
-
-def _set_time_via_stepper(page, t: str) -> bool:
-    """Navigate a +/- stepper UI to reach target time t. Returns True if attempted."""
-    # Find any element visibly showing a time pattern
-    time_el = None
-    for el in page.locator("div, span, p, input").all():
-        try:
-            txt = (el.inner_text(timeout=100) or "").strip()
-            if re.match(r'^\d{1,2}:\d{2}$', txt):
-                time_el = el
-                break
-        except Exception:
-            pass
-
-    if time_el is None:
+    except Exception as e:
+        print(f"  _set_date_via_calendar error: {e}")
         return False
 
-    # Parse current displayed time
+
+def _time_options_loaded(page) -> bool:
+    """True when the time <select> has real options (AJAX populated it)."""
     try:
-        cur_txt = time_el.inner_text(timeout=500).strip()
-        cur_h, cur_m = map(int, cur_txt.split(":"))
+        opts = page.locator(_TIME_SELECT + " option").all()
+        real = [o for o in opts
+                if '--' not in (o.get_attribute('value') or '')
+                and (o.get_attribute('value') or '').strip()]
+        if real:
+            return True
     except Exception:
-        return False
+        pass
+    return False
 
-    tgt_h, tgt_m = map(int, t.split(":"))
-    cur_mins = cur_h * 60 + cur_m
-    tgt_mins = tgt_h * 60 + tgt_m
-    clicks = (tgt_mins - cur_mins) // 30   # each click = 30-min step
 
-    if clicks == 0:
-        return True
+def _get_time_options(page) -> list[tuple[str, str]]:
+    """Return [(epoch_value, display_text)] for all real time options in the select."""
+    opts = []
+    try:
+        for opt in page.locator(_TIME_SELECT + " option").all():
+            v = (opt.get_attribute('value') or '').strip()
+            t = opt.inner_text().strip()
+            if v and '--' not in t and v:
+                opts.append((v, t))
+    except Exception:
+        pass
+    return opts
 
-    # Look for an increment or decrement button near the time element
-    btn_sel = 'button:has-text("+"), button[aria-label*="increase"], button[aria-label*="next"], button[aria-label*="up"]'
-    dec_sel = 'button:has-text("-"), button[aria-label*="decrease"], button[aria-label*="prev"], button[aria-label*="down"]'
 
-    btn_locator = page.locator(btn_sel if clicks > 0 else dec_sel)
-    for _ in range(abs(clicks)):
+def _set_adults(page):
+    """Set adults to NUM_PEOPLE."""
+    try:
+        page.locator(_ADULTS_SEL).select_option(str(NUM_PEOPLE))
+    except Exception as e:
+        print(f"  ⚠ _set_adults: {e}")
+
+
+def _select_table_category(page):
+    """Click the first service-category radio (テーブル / table)."""
+    try:
+        radio = page.locator(_CAT_RADIO).first
+        if not radio.is_checked():
+            radio.click()
+    except Exception:
+        # Fallback: click テーブル text
         try:
-            btn_locator.first.click()
-            page.wait_for_timeout(100)
+            page.get_by_text("テーブル", exact=False).first.click()
         except Exception:
-            break
-
-    return True
+            pass
 
 
-def _click_select(page):
-    """Click the green Select / 選択 button."""
-    for kw in ["Select", "選択", "予約する", "次へ", "Next", "検索", "Search"]:
+def _click_submit(page):
+    """Click the 確定画面へ submit button."""
+    try:
+        page.locator(_SUBMIT).click()
+        return
+    except Exception:
+        pass
+    for kw in ["確定画面へ", "Select", "選択", "次へ", "予約する"]:
         try:
             el = page.get_by_text(kw, exact=True).first
             if el.is_visible():
@@ -478,118 +406,94 @@ def _click_select(page):
                 return
         except Exception:
             continue
-    # Fallback: any submit/button
-    try:
-        page.locator('button[type="submit"]').first.click()
-    except Exception:
-        pass
 
 
 def _check_result(page) -> str:
     """Return 'available', 'unavailable', or 'unknown'."""
-    # Unavailability: orange error message still visible on the same form
     for txt in UNAVAIL_TEXT:
         try:
             if page.get_by_text(txt, exact=False).first.is_visible(timeout=500):
                 return "unavailable"
         except Exception:
             continue
-
-    # Available: page advanced to the customer-info / booking-confirm step
-    for sig in [
-        'input[name*="name"]', 'input[name*="email"]', 'input[name*="phone"]',
-        'text=予約情報', 'text=お客様情報',
-        'button:has-text("確認")', 'button:has-text("Confirm")',
-    ]:
+    # Signs that we advanced to a customer-info / confirmation step
+    for sig in ['input[name="reservation[customer][last_name]"]:visible',
+                'input[name="reservation[customer][email]"]:visible',
+                'text=予約確認', 'text=確認ページ',
+                'button:has-text("確定")']:
         try:
             if page.locator(sig).first.is_visible(timeout=500):
                 return "available"
         except Exception:
             continue
-
     if any(kw in page.url for kw in ("confirm", "booking", "step2", "complete")):
         return "available"
-
     return "unknown"
 
 
 # ---------------------------------------------------------------------------
-# Debug helpers
+# Debug helper
 # ---------------------------------------------------------------------------
 
 def _write_debug_summary(page, ds: str, note: str = ""):
-    """Write a comprehensive markdown summary of all interactive elements on the page."""
     Path("debug").mkdir(exist_ok=True)
-    lines = [f"**URL:** `{page.url}`", f"**Note:** {note}" if note else "", ""]
+    lines = [f"**URL:** `{page.url}`", f"**Note:** {note}", ""]
 
-    # Full DOM scan via JS
     elements = page.evaluate("""() => {
-        const results = [];
+        const out = [];
         for (const el of document.querySelectorAll('*')) {
             const text = (el.innerText || el.textContent || '').trim().slice(0, 100);
             const val  = el.value !== undefined ? String(el.value) : '';
             if (!text && !val) continue;
-            results.push({
-                tag:      el.tagName.toLowerCase(),
-                id:       el.id || '',
-                cls:      (el.className && typeof el.className === 'string')
-                              ? el.className.slice(0, 100) : '',
-                role:     el.getAttribute('role') || '',
-                type:     el.getAttribute('type') || '',
-                name:     el.getAttribute('name') || '',
+            out.push({
+                tag: el.tagName.toLowerCase(),
+                id:  el.id || '',
+                cls: (typeof el.className === 'string') ? el.className.slice(0,100) : '',
+                role: el.getAttribute('role') || '',
+                type: el.getAttribute('type') || '',
+                name: el.getAttribute('name') || '',
                 ariaLabel: el.getAttribute('aria-label') || '',
-                ariaDisabled: el.getAttribute('aria-disabled') || '',
-                dataDate: el.getAttribute('data-date') || '',
-                text:     text,
-                val:      val.slice(0, 60),
+                text: text, val: val.slice(0, 60),
             });
         }
-        return results;
+        return out;
     }""")
 
-    # Section 0: raw HTML of the form/main area
-    lines.append("### Page HTML (first 4000 chars of <body>)")
+    lines.append("### Page HTML (first 5000 chars of <body>)")
     try:
-        html = page.evaluate("() => document.body.innerHTML.slice(0, 4000)")
+        html = page.evaluate("() => document.body.innerHTML.slice(0, 5000)")
         lines.append(f"```html\n{html}\n```")
     except Exception as exc:
         lines.append(f"_(error: {exc})_")
     lines.append("")
 
-    # Section 1: anything whose text or value looks like a time
     time_els = [e for e in elements
                 if re.search(r'\b\d{1,2}:\d{2}\b', e['text'] + ' ' + e['val'])]
-    lines.append(f"### Elements containing a time value ({len(time_els)})")
+    lines.append(f"### Elements with time-like value ({len(time_els)})")
     for e in time_els:
-        lines.append(
-            f"- `<{e['tag']}>` id=`{e['id']}` name=`{e['name']}` "
-            f"type=`{e['type']}` role=`{e['role']}` "
-            f"aria-label=`{e['ariaLabel']}` aria-disabled=`{e['ariaDisabled']}`  "
-            f"class=`{e['cls']}`  text=`{e['text']}`  val=`{e['val']}`"
-        )
+        lines.append(f"- `<{e['tag']}>` name=`{e['name']}` type=`{e['type']}` "
+                     f"val=`{e['val']}` text=`{e['text']}` cls=`{e['cls']}`")
     if not time_els:
-        lines.append("_(none found)_")
-    lines.append("")
-
-    # Section 2: all <select> elements and their options
-    lines.append("### Select elements")
-    found_sel = False
-    for sel_el in page.locator("select").all():
-        try:
-            name = sel_el.get_attribute("name") or sel_el.get_attribute("id") or "?"
-            opts = [(o.get_attribute("value") or "", o.inner_text().strip())
-                    for o in sel_el.locator("option").all()]
-            lines.append(f"- `{name}`: {opts[:30]}")
-            found_sel = True
-        except Exception:
-            continue
-    if not found_sel:
         lines.append("_(none)_")
     lines.append("")
 
-    # Section 3: all input elements
+    lines.append("### Select elements")
+    found = False
+    for sel_el in page.locator("select").all():
+        try:
+            name = sel_el.get_attribute("name") or "?"
+            opts = [(o.get_attribute("value") or "", o.inner_text().strip())
+                    for o in sel_el.locator("option").all()]
+            lines.append(f"- `{name}`: {opts[:30]}")
+            found = True
+        except Exception:
+            continue
+    if not found:
+        lines.append("_(none)_")
+    lines.append("")
+
     lines.append("### Input elements")
-    found_inp = False
+    found = False
     for el in page.locator("input").all():
         try:
             name = el.get_attribute("name") or el.get_attribute("id") or "?"
@@ -597,45 +501,30 @@ def _write_debug_summary(page, ds: str, note: str = ""):
             val  = el.input_value() or ""
             aria = el.get_attribute("aria-label") or ""
             cls  = (el.get_attribute("class") or "")[:80]
-            lines.append(f"- `{name}` type=`{typ}` value=`{val}` aria-label=`{aria}` class=`{cls}`")
-            found_inp = True
+            lines.append(f"- `{name}` type=`{typ}` val=`{val}` aria=`{aria}` cls=`{cls}`")
+            found = True
         except Exception:
             continue
-    if not found_inp:
+    if not found:
         lines.append("_(none)_")
     lines.append("")
 
-    # Section 4: ARIA role elements
-    roles = ["listbox", "combobox", "option", "spinbutton", "slider", "menu", "menuitem"]
-    role_els = [e for e in elements if e['role'] in roles]
-    lines.append(f"### ARIA role elements ({len(role_els)})")
-    for e in role_els:
-        lines.append(
-            f"- role=`{e['role']}` `<{e['tag']}>` id=`{e['id']}` "
-            f"class=`{e['cls']}`  text=`{e['text']}`"
-        )
-    if not role_els:
-        lines.append("_(none)_")
-    lines.append("")
-
-    # Section 5: all buttons
     lines.append("### Buttons")
-    for el in page.locator("button, [role='button']").all():
+    for el in page.locator("button, [role='button'], input[type='submit']").all():
         try:
-            bt  = el.inner_text(timeout=200).strip()
+            bt  = el.inner_text(timeout=200).strip() or el.get_attribute("value") or ""
             cls = (el.get_attribute("class") or "")[:100]
             aria = el.get_attribute("aria-label") or ""
             if bt or aria:
-                lines.append(f"- text=`{bt}` aria-label=`{aria}` class=`{cls}`")
+                lines.append(f"- text=`{bt}` aria=`{aria}` cls=`{cls}`")
         except Exception:
             continue
 
     content = "\n".join(lines)
     Path(f"debug/{ds}_summary.md").write_text(content, encoding="utf-8")
-    # Also print first 2000 chars to stdout so it appears in the Actions log
-    print(f"\n--- DEBUG SUMMARY {ds} ---")
-    print(content[:2000])
-    print("--- END DEBUG SUMMARY ---\n")
+    print(f"\n--- DEBUG {ds} ({note}) ---")
+    print(content[:3000])
+    print("--- END DEBUG ---\n")
 
 
 # ---------------------------------------------------------------------------
@@ -655,9 +544,9 @@ def _format_comment(checked: dict, start: date, end: date) -> str:
         lines += ["", "| Date | Checked | Available |", "|------|---------|-----------|"]
         for d in sorted(checked):
             dt = datetime.strptime(d, "%Y-%m-%d")
-            label = dt.strftime("%a %-d %b")
-            v = checked[d]
-            all_str  = " · ".join(v["all"])       if v["all"]       else "—"
+            label     = dt.strftime("%a %-d %b")
+            v         = checked[d]
+            all_str   = " · ".join(v["all"])       if v["all"]       else "—"
             avail_str = " · ".join(v["available"]) if v["available"] else "—"
             lines.append(f"| **{label}** | {all_str} | {avail_str} |")
 
@@ -673,14 +562,14 @@ def _print_results(checked: dict):
         print("  No dates checked.")
         return
     for d in sorted(checked):
-        v = checked[d]
+        v  = checked[d]
         dt = datetime.strptime(d, "%Y-%m-%d")
         all_str   = "  ".join(v["all"])       if v["all"]       else "–"
         avail_str = "  ".join(v["available"]) if v["available"] else "–"
         print(f"  {dt.strftime('%Y-%m-%d (%a)')}")
         print(f"    checked  : {all_str}")
         print(f"    available: {avail_str}")
-    total = sum(len(v["available"]) for v in checked.values())
+    total      = sum(len(v["available"]) for v in checked.values())
     avail_days = sum(1 for v in checked.values() if v["available"])
     print(f"\n  {total} slot(s) across {avail_days}/{len(checked)} date(s)")
 
