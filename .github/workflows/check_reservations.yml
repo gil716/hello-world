@@ -1,6 +1,8 @@
 name: Check Reservations
 
 on:
+  schedule:
+    - cron: '0 * * * *'   # every hour at :00
   workflow_dispatch:
     inputs:
       start_date:
@@ -42,17 +44,33 @@ jobs:
       - name: Run availability check
         run: |
           python3 check_reservations.py \
-            --start "${{ inputs.start_date }}" \
-            --end   "${{ inputs.end_date }}" \
+            --start "${{ inputs.start_date || '2026-07-07' }}" \
+            --end   "${{ inputs.end_date   || '2026-07-10' }}" \
             --comment-file comment.md \
             --debug-screenshots
 
-
-      - name: Find or create tracking issue
-        id: issue
+      - name: Post results to issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Count available slots
+          SLOTS=$(python3 -c "
+          import json, sys
+          try:
+              d = json.load(open('reservations.json'))
+              print(len(d.get('slots', [])))
+          except Exception:
+              print(0)
+          ")
+
+          # Scheduled runs: only post when slots found.
+          # Manual runs: always post (useful for testing).
+          EVENT="${{ github.event_name }}"
+          if [ "$EVENT" != "workflow_dispatch" ] && [ "$SLOTS" -eq 0 ]; then
+            echo "No availability found — skipping issue comment for scheduled run."
+            exit 0
+          fi
+
           REPO="${{ github.repository }}"
           NUM=$(gh issue list \
             --repo "$REPO" \
@@ -68,15 +86,17 @@ jobs:
           else
             echo "Using existing issue #$NUM"
           fi
-          echo "number=$NUM" >> "$GITHUB_OUTPUT"
 
-      - name: Post results comment
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh issue comment "${{ steps.issue.outputs.number }}" \
-            --repo "${{ github.repository }}" \
-            --body-file comment.md
+          if [ "$SLOTS" -gt 0 ]; then
+            # Prepend @mention so GitHub emails the repo owner
+            {
+              printf '@%s — 🍕 availability found!\n\n' "${{ github.repository_owner }}"
+              cat comment.md
+            } > notify.md
+            gh issue comment "$NUM" --repo "$REPO" --body-file notify.md
+          else
+            gh issue comment "$NUM" --repo "$REPO" --body-file comment.md
+          fi
 
       - name: Post debug info if no times found
         env:
@@ -84,20 +104,25 @@ jobs:
         run: |
           SUMMARIES=$(ls debug/*_summary.md 2>/dev/null || true)
           if [ -n "$SUMMARIES" ]; then
-            {
-              echo "## 🔍 Debug — page state when no times were found"
-              echo ""
-              for f in $SUMMARIES; do
-                DATE=$(basename "$f" _summary.md)
-                echo "### $DATE"
+            REPO="${{ github.repository }}"
+            NUM=$(gh issue list \
+              --repo "$REPO" \
+              --search "Pizza Marumo Reservation Results in:title" \
+              --state open --json number --jq '.[0].number // empty')
+            if [ -n "$NUM" ]; then
+              {
+                echo "## 🔍 Debug — page state when no times were found"
                 echo ""
-                cat "$f"
-                echo ""
-                echo "---"
-                echo ""
-              done
-            } > debug_comment.md
-            gh issue comment "${{ steps.issue.outputs.number }}" \
-              --repo "${{ github.repository }}" \
-              --body-file debug_comment.md
+                for f in $SUMMARIES; do
+                  DATE=$(basename "$f" _summary.md)
+                  echo "### $DATE"
+                  echo ""
+                  cat "$f"
+                  echo ""
+                  echo "---"
+                  echo ""
+                done
+              } > debug_comment.md
+              gh issue comment "$NUM" --repo "$REPO" --body-file debug_comment.md
+            fi
           fi
