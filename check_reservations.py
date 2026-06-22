@@ -5,18 +5,12 @@ Checks all time slots for 4 adults, table service.
 
 Form flow (as seen on the actual page)
 ---------------------------------------
-The page shows a form with:
-  - Date field (date picker)
-  - Time dropdown (stepper/select)
-  - Adults count (stepper/select)
-  - Category buttons: table | counter | private room
-  - Green "Select" button
+1. A "Notice from the Store" checkbox must be ticked first.
+2. The form has: date stepper, time stepper, adults select, category buttons.
+3. Click the green Select button.
+4. If the page advances → available; orange error → not available.
 
-For each date in range, for each time option in the dropdown:
-  1. Set date, time=T, adults=4, category=table
-  2. Click Select
-  3. If page advances → available; if orange error appears → not available
-  4. Navigate back and try next time
+For each date we try every 30-minute slot 11:00–21:00.
 
 Usage
 -----
@@ -36,12 +30,20 @@ NUM_PEOPLE = 4
 SHOP_SLUG = "pizza-marumo"
 RESERVE_URL = f"https://www.tablecheck.com/ja/shops/{SHOP_SLUG}/reserve"
 
+# All 30-minute slots to try (restaurant open lunch + dinner)
+ALL_TIMES = [
+    f"{h:02d}:{m:02d}"
+    for h in range(11, 22)
+    for m in (0, 30)
+]
+
 # Error text shown when a slot is unavailable
 UNAVAIL_TEXT = [
     "Reservations are not available in the category",
     "ご選択のカテゴリー",
     "満席",
     "Please select a different category",
+    "not available",
 ]
 
 
@@ -110,67 +112,73 @@ def run(start: date, end: date, headless: bool, output_path: str,
             ds = current.isoformat()
             print(f"\n{ds}")
 
-            # Reset to the form for this date
+            # Fresh page load for each date
             page.goto(RESERVE_URL, wait_until="domcontentloaded", timeout=30_000)
-            page.wait_for_timeout(2_000)
+            page.wait_for_timeout(3_000)
 
-            # Set date
+            # 1. Tick the "Notice from the Store" agreement checkbox
+            _accept_notice(page)
+            page.wait_for_timeout(500)
+
+            # 2. Set date
             if not _set_date(page, current):
-                print("  ⚠ could not set date")
+                print("  ⚠ could not set date — dumping debug info")
+                _write_debug_summary(page, ds)
                 checked[ds] = {"all": [], "available": []}
                 current += timedelta(days=1)
                 continue
 
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(800)
 
-            # Set adults = 4
+            # 3. Set adults = 4
             _set_adults(page, NUM_PEOPLE)
             page.wait_for_timeout(500)
 
-            # Select "table" category
+            # 4. Select "table" category
             _select_category(page, "table")
             page.wait_for_timeout(500)
 
             if debug:
                 page.screenshot(path=f"debug/{ds}_form_ready.png")
 
-            # Get all time options available in the dropdown
-            times = _get_time_options(page)
-            print(f"  Time options: {times or '(none found)'}")
+            # Dump debug info for the first date so we can verify form state
+            if current == start:
+                _write_debug_summary(page, ds)
 
-            # Always dump debug summary (overwritten each date; last one posted)
-            _write_debug_summary(page, ds)
-
-            if not times:
-                checked[ds] = {"all": [], "available": []}
-                current += timedelta(days=1)
-                continue
-
-            all_times: list[str] = list(times)
+            all_times: list[str] = []
             avail_times: list[str] = []
 
-            for t in times:
-                _select_time(page, t)
-                page.wait_for_timeout(400)
-                _select_category(page, "table")   # re-assert in case it reset
+            for t in ALL_TIMES:
+                # Set the time field
+                if not _set_time(page, t):
+                    continue        # time field not found — skip silently
+
+                page.wait_for_timeout(300)
+                _select_category(page, "table")   # re-assert in case reset
                 page.wait_for_timeout(200)
 
                 _click_select(page)
                 page.wait_for_timeout(2_000)
 
                 if debug:
-                    page.screenshot(path=f"debug/{ds}_{t.replace(':', '')}_after_select.png")
+                    page.screenshot(path=f"debug/{ds}_{t.replace(':', '')}.png")
 
-                if _slot_available(page):
+                result = _check_result(page)
+
+                if result == "available":
+                    all_times.append(t)
                     avail_times.append(t)
                     print(f"  {t}: ✓ available")
-                    # Navigate back to the form
                     page.go_back(wait_until="domcontentloaded", timeout=10_000)
                     page.wait_for_timeout(1_500)
                     _select_category(page, "table")
-                else:
+                elif result == "unavailable":
+                    all_times.append(t)
                     print(f"  {t}: ✗ not available")
-                    # Still on the form page — just change the time and try next
+                    # Still on form — try next time
+                else:
+                    # "unknown" — time probably doesn't exist on the form, skip
+                    pass
 
             checked[ds] = {
                 "all": sorted(set(all_times)),
@@ -323,68 +331,59 @@ def _select_category(page, category: str):
                 continue
 
 
-def _get_time_options(page) -> list[str]:
-    """Return all time values from the time select/stepper."""
-    # <select> with time options
-    for sel in ['select[name*="time"]', 'select[name*="hour"]',
-                'select[name*="start"]', 'select']:
-        try:
-            el = page.locator(sel).first
-            if not el.is_visible():
-                continue
-            opts = []
-            for opt in el.locator("option").all():
-                v = opt.get_attribute("value") or opt.inner_text().strip()
-                if re.match(r'\d{1,2}:\d{2}', v):
-                    opts.append(v[:5])
-            if opts:
-                return sorted(set(opts))
-        except Exception:
-            continue
-
-    # If no <select>, look for any element that already shows a time (stepper)
-    # and collect possible values by inspecting nearby option lists
-    times = []
-    for el in page.locator("input, [role='option'], option").all():
-        try:
-            v = (el.get_attribute("value") or el.inner_text() or "").strip()
-            if re.match(r'^\d{1,2}:\d{2}$', v):
-                times.append(v[:5])
-        except Exception:
-            continue
-
-    return sorted(set(times))
-
-
-def _select_time(page, t: str):
-    """Select time t in the time field."""
-    # <select>
-    for sel in ['select[name*="time"]', 'select[name*="hour"]',
-                'select[name*="start"]', 'select']:
+def _accept_notice(page):
+    """Tick the 'Notice from the Store' agreement checkbox."""
+    for sel in [
+        'input[type="checkbox"]',
+        '[role="checkbox"]',
+        'label:has-text("agree")',
+        'label:has-text("同意")',
+        'label:has-text("注意")',
+    ]:
         try:
             el = page.locator(sel).first
             if el.is_visible():
-                el.select_option(value=t)
+                try:
+                    if el.is_checked():
+                        return   # already ticked
+                except Exception:
+                    pass
+                el.click()
+                page.wait_for_timeout(300)
                 return
         except Exception:
             continue
 
-    # Custom stepper: click options directly
-    try:
-        opt = page.locator(f'[role="option"]:has-text("{t}"), option:has-text("{t}")').first
-        if opt.is_visible():
-            opt.click()
-            return
-    except Exception:
-        pass
 
-    # Fill an input
-    try:
-        el = page.locator('input[name*="time"]').first
-        if el.is_visible():
-            el.fill(t)
-    except Exception:
-        pass
+def _set_time(page, t: str) -> bool:
+    """Fill the time stepper with value t (e.g. '17:00'). Returns True if found."""
+    for sel in [
+        'input[type="time"]',
+        'input[name*="time"]',
+        'input[name*="hour"]',
+        'input[name*="start"]',
+    ]:
+        try:
+            el = page.locator(sel).first
+            if el.is_visible():
+                el.fill(t)
+                el.dispatch_event("change")
+                el.dispatch_event("input")
+                return True
+        except Exception:
+            continue
+
+    # Fallback: try any <select> that has this time as an option
+    for sel in ['select[name*="time"]', 'select[name*="hour"]', 'select[name*="start"]']:
+        try:
+            el = page.locator(sel).first
+            if el.is_visible():
+                el.select_option(value=t)
+                return True
+        except Exception:
+            continue
+
+    return False
 
 
 def _click_select(page):
@@ -404,33 +403,32 @@ def _click_select(page):
         pass
 
 
-def _slot_available(page) -> bool:
-    """Return True if the page advanced past the form (slot is bookable)."""
-    # Check for known unavailability text
+def _check_result(page) -> str:
+    """Return 'available', 'unavailable', or 'unknown'."""
+    # Unavailability: orange error message still visible on the same form
     for txt in UNAVAIL_TEXT:
         try:
-            if page.get_by_text(txt).first.is_visible(timeout=500):
-                return False
+            if page.get_by_text(txt, exact=False).first.is_visible(timeout=500):
+                return "unavailable"
         except Exception:
             continue
 
-    # Check for signals that we moved to next step
+    # Available: page advanced to the customer-info / booking-confirm step
     for sig in [
         'input[name*="name"]', 'input[name*="email"]', 'input[name*="phone"]',
-        'text=予約情報', 'text=お客様情報', 'text=確認',
+        'text=予約情報', 'text=お客様情報',
         'button:has-text("確認")', 'button:has-text("Confirm")',
     ]:
         try:
             if page.locator(sig).first.is_visible(timeout=500):
-                return True
+                return "available"
         except Exception:
             continue
 
-    # URL change is also a good signal
     if any(kw in page.url for kw in ("confirm", "booking", "step2", "complete")):
-        return True
+        return "available"
 
-    return False
+    return "unknown"
 
 
 # ---------------------------------------------------------------------------
