@@ -144,6 +144,7 @@ def run(start: date, end: date, headless: bool, output_path: str,
             avail_times: list[str] = []
 
             for epoch_val, time_label in time_opts:
+                print(f"  trying {time_label} (epoch={epoch_val})")
                 # Set time
                 try:
                     page.locator(_TIME_SELECT).select_option(value=epoch_val)
@@ -158,13 +159,14 @@ def run(start: date, end: date, headless: bool, output_path: str,
                 page.wait_for_timeout(200)
 
                 # Submit
+                url_before = page.url
                 _click_submit(page)
                 page.wait_for_timeout(2_000)
 
                 if debug:
                     page.screenshot(path=f"debug/{ds}_{time_label.replace(':', '')}.png")
 
-                result = _check_result(page)
+                result = _check_result(page, url_before)
                 all_times.append(time_label)
 
                 if result == "available":
@@ -394,8 +396,11 @@ def _select_table_category(page):
 def _click_submit(page):
     """Click the 確定画面へ submit button."""
     try:
-        page.locator(_SUBMIT).click()
-        return
+        btn = page.locator(_SUBMIT)
+        if btn.is_visible(timeout=1_000):
+            print(f"    submit btn class={btn.get_attribute('class')}")
+            btn.click()
+            return
     except Exception:
         pass
     for kw in ["確定画面へ", "Select", "選択", "次へ", "予約する"]:
@@ -408,26 +413,41 @@ def _click_submit(page):
             continue
 
 
-def _check_result(page) -> str:
+def _check_result(page, url_before: str) -> str:
     """Return 'available', 'unavailable', or 'unknown'."""
+    url_after = page.url
+    print(f"    url_before={url_before[:60]}")
+    print(f"    url_after ={url_after[:60]}")
+
+    # URL changed → navigated to a new page → available
+    if url_after != url_before:
+        if any(kw in url_after for kw in ("confirm", "booking", "step2", "complete", "new")):
+            return "available"
+
+    # Error text still on page → unavailable
     for txt in UNAVAIL_TEXT:
         try:
-            if page.get_by_text(txt, exact=False).first.is_visible(timeout=500):
+            if page.get_by_text(txt, exact=False).first.is_visible(timeout=400):
                 return "unavailable"
         except Exception:
             continue
-    # Signs that we advanced to a customer-info / confirmation step
-    for sig in ['input[name="reservation[customer][last_name]"]:visible',
-                'input[name="reservation[customer][email]"]:visible',
-                'text=予約確認', 'text=確認ページ',
-                'button:has-text("確定")']:
+
+    # Form collapsed: time select is now hidden → advanced to next section
+    try:
+        if not page.locator(_TIME_SELECT).is_visible(timeout=300):
+            print("    time select hidden → available")
+            return "available"
+    except Exception:
+        pass
+
+    # Confirmation-specific header text (not present on initial form)
+    for txt in ["予約確認", "確認ページ", "Reservation Confirmation"]:
         try:
-            if page.locator(sig).first.is_visible(timeout=500):
+            if page.get_by_text(txt, exact=False).first.is_visible(timeout=300):
                 return "available"
         except Exception:
             continue
-    if any(kw in page.url for kw in ("confirm", "booking", "step2", "complete")):
-        return "available"
+
     return "unknown"
 
 
