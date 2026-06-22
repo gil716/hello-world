@@ -167,6 +167,7 @@ def run(start: date, end: date, headless: bool, output_path: str,
 
             if debug:
                 page.screenshot(path=f"debug/{ds}_after_date_click.png")
+                _dump_html(page, f"debug/{ds}_after_date_click.html")
 
             # Collect all time slots visible after clicking the date
             slots = _collect_time_slots(page)
