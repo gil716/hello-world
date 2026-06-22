@@ -1,0 +1,103 @@
+name: Check Reservations
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Start date (YYYY-MM-DD)"
+        required: true
+        default: "2026-07-07"
+      end_date:
+        description: "End date (YYYY-MM-DD)"
+        required: true
+        default: "2026-07-10"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Chromium
+        run: playwright install --with-deps chromium
+
+      - name: Run availability check
+        run: |
+          python3 check_reservations.py \
+            --start "${{ inputs.start_date }}" \
+            --end   "${{ inputs.end_date }}" \
+            --comment-file comment.md \
+            --debug-screenshots
+
+
+      - name: Find or create tracking issue
+        id: issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+          NUM=$(gh issue list \
+            --repo "$REPO" \
+            --search "Pizza Marumo Reservation Results in:title" \
+            --state open --json number --jq '.[0].number // empty')
+          if [ -z "$NUM" ]; then
+            URL=$(gh issue create \
+              --repo "$REPO" \
+              --title "Pizza Marumo - Reservation Results" \
+              --body "Availability check results are posted as comments below.")
+            NUM=$(echo "$URL" | grep -o '[0-9]*$')
+            echo "Created tracking issue #$NUM"
+          else
+            echo "Using existing issue #$NUM"
+          fi
+          echo "number=$NUM" >> "$GITHUB_OUTPUT"
+
+      - name: Post results comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment "${{ steps.issue.outputs.number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file comment.md
+
+      - name: Post debug info if no times found
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SUMMARIES=$(ls debug/*_summary.md 2>/dev/null || true)
+          if [ -n "$SUMMARIES" ]; then
+            {
+              echo "## 🔍 Debug — page state when no times were found"
+              echo ""
+              for f in $SUMMARIES; do
+                DATE=$(basename "$f" _summary.md)
+                echo "### $DATE"
+                echo ""
+                cat "$f"
+                echo ""
+                echo "---"
+                echo ""
+              done
+            } > debug_comment.md
+            gh issue comment "${{ steps.issue.outputs.number }}" \
+              --repo "${{ github.repository }}" \
+              --body-file debug_comment.md
+          fi
