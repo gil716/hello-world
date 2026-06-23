@@ -43,11 +43,11 @@ _SUBMIT      = 'input[name="commit"]'
 
 UNAVAIL_TEXT = [
     "Reservations are not available in the category",
+    "Please select a different category",
     "ご選択のカテゴリー",
     "満席",
-    "Please select a different category",
-    "not available",
     "ご希望の時間帯",
+    "予約ができません",
 ]
 
 
@@ -161,7 +161,7 @@ def run(start: date, end: date, headless: bool, output_path: str,
                 # Submit
                 url_before = page.url
                 _click_submit(page)
-                page.wait_for_timeout(2_000)
+                page.wait_for_timeout(3_000)
 
                 if debug:
                     page.screenshot(path=f"debug/{ds}_{time_label.replace(':', '')}.png")
@@ -379,7 +379,8 @@ def _get_time_options(page) -> list[tuple[str, str]]:
 def _set_adults(page):
     """Set adults to NUM_PEOPLE."""
     try:
-        page.locator(_ADULTS_SEL).select_option(str(NUM_PEOPLE))
+        page.locator(_ADULTS_SEL).select_option(str(NUM_PEOPLE), timeout=5_000)
+        print(f"  ✓ adults set to {NUM_PEOPLE}")
     except Exception as e:
         print(f"  ⚠ _set_adults: {e}")
 
@@ -424,31 +425,34 @@ def _check_result(page, url_before: str) -> str:
     print(f"    url_before={url_before[:60]}")
     print(f"    url_after ={url_after[:60]}")
 
-    # URL changed → navigated to a new page → available
-    if url_after != url_before:
-        if any(kw in url_after for kw in ("confirm", "booking", "step2", "complete", "new")):
-            return "available"
-
-    # Error text still on page → unavailable
+    # Check error text first — 1500ms per check gives the orange banner time to render
     for txt in UNAVAIL_TEXT:
         try:
-            if page.get_by_text(txt, exact=False).first.is_visible(timeout=400):
+            if page.get_by_text(txt, exact=False).first.is_visible(timeout=1_500):
+                print(f"    error text found: {txt!r}")
                 return "unavailable"
         except Exception:
             continue
 
-    # Form collapsed: time select is now hidden → advanced to next section
-    try:
-        if not page.locator(_TIME_SELECT).is_visible(timeout=300):
-            print("    time select hidden → available")
+    # URL changed → navigated away from the reserve form → available
+    if url_after != url_before:
+        print("    URL changed — checking for confirmation keywords")
+        if any(kw in url_after for kw in ("confirm", "booking", "step2", "complete", "new")):
             return "available"
-    except Exception:
-        pass
+        # URL changed without a known keyword — check for confirmation text
+        for txt in ["予約確認", "確認ページ", "Reservation Confirmation"]:
+            try:
+                if page.get_by_text(txt, exact=False).first.is_visible(timeout=500):
+                    return "available"
+            except Exception:
+                continue
+        # URL changed, no error, no known confirmation text — treat as available
+        return "available"
 
-    # Confirmation-specific header text (not present on initial form)
+    # Same URL — check for confirmation text appearing via AJAX
     for txt in ["予約確認", "確認ページ", "Reservation Confirmation"]:
         try:
-            if page.get_by_text(txt, exact=False).first.is_visible(timeout=300):
+            if page.get_by_text(txt, exact=False).first.is_visible(timeout=500):
                 return "available"
         except Exception:
             continue
