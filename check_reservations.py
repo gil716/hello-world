@@ -158,10 +158,13 @@ def run(start: date, end: date, headless: bool, output_path: str,
                 _select_table_category(page)
                 page.wait_for_timeout(200)
 
-                # Submit
+                # Submit — form.submit() causes real navigation; wait for it
                 url_before = page.url
                 _click_submit(page)
-                page.wait_for_timeout(3_000)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=10_000)
+                except Exception:
+                    page.wait_for_timeout(3_000)
 
                 if debug:
                     page.screenshot(path=f"debug/{ds}_{time_label.replace(':', '')}.png")
@@ -400,25 +403,35 @@ def _select_table_category(page):
 
 
 def _click_submit(page):
-    """Click the 確定画面へ submit button."""
+    """Submit the reservation form."""
+    # Log button state for diagnostics
     try:
         btn = page.locator(_SUBMIT)
-        if btn.is_visible(timeout=1_000):
-            cls = btn.get_attribute('class') or ''
-            print(f"    submit btn class={cls}")
-            # Use JS click to bypass CSS-disabled state that blocks Playwright click
-            btn.evaluate("el => el.click()")
+        cls = btn.get_attribute('class', timeout=1_000) or ''
+        print(f"    submit btn class={cls!r}")
+    except Exception:
+        cls = ''
+
+    # If button is NOT disabled, normal click is fine
+    if cls and 'btn-disabled' not in cls:
+        try:
+            page.locator(_SUBMIT).click(timeout=2_000)
             return
-    except Exception:
-        pass
-    # Fallback: try submitting the form directly via JS
+        except Exception as e:
+            print(f"    normal click failed: {e}")
+
+    # Button is disabled (JS guards prevent submission).
+    # form.submit() bypasses ALL JS event handlers and submits directly.
     try:
-        page.evaluate("""() => {
+        r = page.evaluate("""() => {
             const f = document.querySelector('form');
-            if (f) { f.requestSubmit ? f.requestSubmit() : f.submit(); }
+            if (!f) return 'no-form';
+            f.submit();
+            return 'ok';
         }""")
-    except Exception:
-        pass
+        print(f"    form.submit()={r}")
+    except Exception as e:
+        print(f"    form.submit error: {e}")
 
 
 def _check_result(page, url_before: str) -> str:
