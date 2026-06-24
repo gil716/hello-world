@@ -404,19 +404,21 @@ def _click_submit(page):
     try:
         btn = page.locator(_SUBMIT)
         if btn.is_visible(timeout=1_000):
-            print(f"    submit btn class={btn.get_attribute('class')}")
-            btn.click()
+            cls = btn.get_attribute('class') or ''
+            print(f"    submit btn class={cls}")
+            # Use JS click to bypass CSS-disabled state that blocks Playwright click
+            btn.evaluate("el => el.click()")
             return
     except Exception:
         pass
-    for kw in ["確定画面へ", "Select", "選択", "次へ", "予約する"]:
-        try:
-            el = page.get_by_text(kw, exact=True).first
-            if el.is_visible():
-                el.click()
-                return
-        except Exception:
-            continue
+    # Fallback: try submitting the form directly via JS
+    try:
+        page.evaluate("""() => {
+            const f = document.querySelector('form');
+            if (f) { f.requestSubmit ? f.requestSubmit() : f.submit(); }
+        }""")
+    except Exception:
+        pass
 
 
 def _check_result(page, url_before: str) -> str:
@@ -425,38 +427,31 @@ def _check_result(page, url_before: str) -> str:
     print(f"    url_before={url_before[:60]}")
     print(f"    url_after ={url_after[:60]}")
 
-    # Check error text first — 1500ms per check gives the orange banner time to render
+    # Dump body text for reliable string matching and diagnostics
+    try:
+        body_text = page.inner_text("body", timeout=3_000)
+    except Exception:
+        body_text = ""
+    print(f"    body[0:400]={body_text[:400]!r}")
+
+    # Error text in body → submit fired but slot is unavailable
     for txt in UNAVAIL_TEXT:
-        try:
-            if page.get_by_text(txt, exact=False).first.is_visible(timeout=1_500):
-                print(f"    error text found: {txt!r}")
-                return "unavailable"
-        except Exception:
-            continue
+        if txt in body_text:
+            print(f"    error text found: {txt!r}")
+            return "unavailable"
 
-    # URL changed → navigated away from the reserve form → available
+    # URL changed → navigated to a booking/confirmation page → available
     if url_after != url_before:
-        print("    URL changed — checking for confirmation keywords")
-        if any(kw in url_after for kw in ("confirm", "booking", "step2", "complete", "new")):
+        print("    URL changed")
+        if any(kw in url_after for kw in ("confirm", "booking", "step2", "complete")):
             return "available"
-        # URL changed without a known keyword — check for confirmation text
         for txt in ["予約確認", "確認ページ", "Reservation Confirmation"]:
-            try:
-                if page.get_by_text(txt, exact=False).first.is_visible(timeout=500):
-                    return "available"
-            except Exception:
-                continue
-        # URL changed, no error, no known confirmation text — treat as available
-        return "available"
-
-    # Same URL — check for confirmation text appearing via AJAX
-    for txt in ["予約確認", "確認ページ", "Reservation Confirmation"]:
-        try:
-            if page.get_by_text(txt, exact=False).first.is_visible(timeout=500):
+            if txt in body_text:
                 return "available"
-        except Exception:
-            continue
+        return "unknown"
 
+    # Same URL + no error text → submit likely did not fire (btn-disabled / bot-block)
+    # Never count this as "available" — return unknown so it is not reported.
     return "unknown"
 
 
