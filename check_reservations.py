@@ -2,20 +2,16 @@
 """
 TableCheck reservation availability checker for Pizza Marumo.
 
-Form structure (discovered via debug dump):
-  - Checkbox:  input[name="reservation_confirm_shop_note"]
-  - Date:      input[name="reservation[start_date]"]  ← Mobiscroll picker
-  - Time:      select[name="reservation[start_at_epoch]"] ← AJAX-populated after date set
-  - Adults:    select[name="reservation[num_people_adult]"]
-  - Category:  input[name="reservation[service_category]"] (radio, 3 options)
-  - Submit:    input[name="commit"]  value="確定画面へ"
-
-Flow:
-  1. Tick checkbox
-  2. Set date via Mobiscroll (jQuery API or calendar click)
-  3. Wait for time <select> to populate (AJAX fires on date change)
-  4. For each time option: select it, set adults+category, click submit
-  5. Unavailable → orange error, still on form; Available → new page
+Correct UI flow (confirmed by user):
+  1. Tick notice checkbox
+  2. Set date (Mobiscroll picker)
+  3. Set adults = 4
+  4. Click テーブル seat type → turns blue
+  5. Click ディナー plan card → turns green (labeled "dinner")
+  6. For each time slot from 17:00:
+       - Select/click the time → bottom popup appears
+       - Read popup: indicates available or unavailable
+       - Dismiss popup, try next time
 
 Usage:
     pip install playwright && playwright install chromium
@@ -29,18 +25,18 @@ import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-NUM_PEOPLE = 4
-SHOP_SLUG  = "pizza-marumo"
+NUM_PEOPLE  = 4
+MIN_HOUR    = 17      # dinner only — skip lunch times
+SHOP_SLUG   = "pizza-marumo"
 RESERVE_URL = f"https://www.tablecheck.com/ja/shops/{SHOP_SLUG}/reserve"
 
-# Exact selectors from the live DOM
+# Known form field selectors
 _NOTICE_CB   = 'input[name="reservation_confirm_shop_note"]'
 _DATE_INPUT  = 'input[name="reservation[start_date]"]'
 _TIME_SELECT = 'select[name="reservation[start_at_epoch]"]'
 _ADULTS_SEL  = 'select[name="reservation[num_people_adult]"]'
-_CAT_RADIO   = 'input[name="reservation[service_category]"]:not([type="hidden"])'
-_SUBMIT      = 'input[name="commit"]'
 
+# Text that confirms a slot is UNAVAILABLE (error popup / flash message)
 UNAVAIL_TEXT = [
     "Reservations are not available in the category",
     "Please select a different category",
@@ -48,6 +44,17 @@ UNAVAIL_TEXT = [
     "満席",
     "ご希望の時間帯",
     "予約ができません",
+    "ご利用いただけません",
+    "受付不可",
+]
+
+# Text that confirms the popup is a BOOKING CONFIRMATION (slot available)
+AVAIL_TEXT = [
+    "予約する",       # "Make reservation"
+    "予約を確定",     # "Confirm reservation"
+    "ご予約を確認",   # "Confirm your reservation"
+    "次のステップ",   # "Next step"
+    "進む",           # "Proceed"
 ]
 
 
@@ -80,8 +87,9 @@ def run(start: date, end: date, headless: bool, output_path: str,
 
     days = (end - start).days + 1
     print(f"Pizza Marumo — reservation checker")
-    print(f"  Guests   : {NUM_PEOPLE} adults, table service")
-    print(f"  Range    : {start} → {end}  ({days} day(s))\n")
+    print(f"  Guests   : {NUM_PEOPLE} adults, table/dinner")
+    print(f"  Range    : {start} → {end}  ({days} day(s))")
+    print(f"  Times    : {MIN_HOUR}:00 onwards only\n")
 
     if debug:
         Path("debug").mkdir(exist_ok=True)
@@ -112,11 +120,11 @@ def run(start: date, end: date, headless: bool, output_path: str,
             if debug:
                 page.screenshot(path=f"debug/{ds}_01_loaded.png")
 
-            # 1. Tick the notice checkbox
+            # Step 1: tick notice checkbox
             _accept_notice(page)
             page.wait_for_timeout(500)
 
-            # 2. Set date and wait for time options to load
+            # Step 2: set date
             if not _set_date(page, current):
                 print("  ✗ could not set date")
                 _write_debug_summary(page, ds, "_set_date() failed")
@@ -124,70 +132,84 @@ def run(start: date, end: date, headless: bool, output_path: str,
                 current += timedelta(days=1)
                 continue
 
+            page.wait_for_timeout(1_000)
+
+            # Step 3: set adults
+            _set_adults(page)
+            page.wait_for_timeout(500)
+
             if debug:
-                page.screenshot(path=f"debug/{ds}_02_date_set.png")
+                page.screenshot(path=f"debug/{ds}_02_date_adults.png")
 
-            # 3. Collect time options (populated by AJAX after date set)
-            time_opts = _get_time_options(page)
-            print(f"  {len(time_opts)} time option(s): {[t for _, t in time_opts]}")
-
-            if not time_opts:
-                _write_debug_summary(page, ds, "no time options after date set")
+            # Step 4: click テーブル seat type (turns blue)
+            if not _select_table_seat(page):
+                _write_debug_summary(page, ds, "テーブル seat type not found")
                 checked[ds] = {"all": [], "available": []}
                 current += timedelta(days=1)
                 continue
 
-            # 4. Set adults (stays constant across all time trials)
-            _set_adults(page)
+            page.wait_for_timeout(1_500)
+
+            if debug:
+                page.screenshot(path=f"debug/{ds}_03_table.png")
+
+            # Step 5: click ディナー plan (turns green)
+            if not _select_dinner_plan(page):
+                _write_debug_summary(page, ds, "ディナー plan not found")
+                checked[ds] = {"all": [], "available": []}
+                current += timedelta(days=1)
+                continue
+
+            page.wait_for_timeout(1_500)
+
+            if debug:
+                page.screenshot(path=f"debug/{ds}_04_dinner.png")
+
+            # Step 6: collect time options (≥ MIN_HOUR)
+            time_opts = _get_time_options(page)
+            print(f"  {len(time_opts)} time option(s): {[t for _, t in time_opts]}")
+
+            if not time_opts:
+                _write_debug_summary(page, ds, "no time options after seat+plan selection")
+                checked[ds] = {"all": [], "available": []}
+                current += timedelta(days=1)
+                continue
 
             all_times:   list[str] = []
             avail_times: list[str] = []
 
             for epoch_val, time_label in time_opts:
-                print(f"  trying {time_label} (epoch={epoch_val})")
-                # Set time
+                print(f"  trying {time_label}")
+
+                # Select the time — this should trigger the bottom popup
                 try:
                     page.locator(_TIME_SELECT).select_option(value=epoch_val, timeout=5_000)
                 except Exception as e:
-                    print(f"  ⚠ could not select time {time_label}: {e}")
-                    continue
+                    print(f"  ⚠ could not select time: {e}")
+                    # Fallback: try clicking a time button with this label
+                    if not _click_time_button(page, time_label):
+                        continue
 
-                page.wait_for_timeout(300)
-
-                # Set category = table (first radio = テーブル)
-                _select_table_category(page)
-                page.wait_for_timeout(200)
-
-                # Submit
-                url_before = page.url
-                _click_submit(page)
-                page.wait_for_timeout(3_000)
+                # Wait for the popup to appear
+                page.wait_for_timeout(2_000)
 
                 if debug:
                     page.screenshot(path=f"debug/{ds}_{time_label.replace(':', '')}.png")
 
-                result = _check_result(page, url_before)
+                result = _check_popup(page)
                 all_times.append(time_label)
 
                 if result == "available":
                     avail_times.append(time_label)
                     print(f"  {time_label}: ✓ available")
-                    # Reload form fresh so remaining slots can be checked
-                    page.goto(RESERVE_URL, wait_until="domcontentloaded", timeout=30_000)
-                    page.wait_for_timeout(3_000)
-                    _accept_notice(page)
-                    page.wait_for_timeout(500)
-                    if not _set_date(page, current):
-                        print("  ⚠ could not re-set date after available result — stopping date")
-                        break
-                    page.wait_for_timeout(1_500)
-                    _set_adults(page)
                 elif result == "unavailable":
                     print(f"  {time_label}: ✗ not available")
                 else:
-                    print(f"  {time_label}: ? unknown result (url={page.url[:60]})")
-                    if debug:
-                        page.screenshot(path=f"debug/{ds}_{time_label.replace(':', '')}_unknown.png")
+                    print(f"  {time_label}: ? unknown")
+
+                # Dismiss popup before trying next time
+                _dismiss_popup(page)
+                page.wait_for_timeout(500)
 
             checked[ds] = {
                 "all":       sorted(set(all_times)),
@@ -214,6 +236,7 @@ def run(start: date, end: date, headless: bool, output_path: str,
             "shop":        SHOP_SLUG,
             "num_people":  NUM_PEOPLE,
             "seat_type":   "table",
+            "plan":        "dinner",
             "range_start": str(start),
             "range_end":   str(end),
             "checked":     checked,
@@ -246,13 +269,9 @@ def _accept_notice(page):
 
 
 def _set_date(page, d: date) -> bool:
-    """
-    Set the Mobiscroll date picker to d.
-    Returns True when the time <select> subsequently gets populated (AJAX success).
-    """
-    ds_slash = f"{d.year}/{d.month:02d}/{d.day:02d}"  # Mobiscroll default format
+    """Set the Mobiscroll date picker. Returns True when time options load."""
+    ds_slash = f"{d.year}/{d.month:02d}/{d.day:02d}"
 
-    # --- Attempt 1: jQuery Mobiscroll API ---
     method = page.evaluate(f"""() => {{
         const el = document.querySelector('{_DATE_INPUT}');
         if (!el) return 'not-found';
@@ -263,7 +282,6 @@ def _set_date(page, d: date) -> bool:
                 return 'mbsc-jquery';
             }} catch(e) {{ }}
         }}
-        // Try setting the string value + jQuery trigger
         el.value = '{ds_slash}';
         if (window.$) {{
             $(el).trigger('change');
@@ -279,7 +297,6 @@ def _set_date(page, d: date) -> bool:
     if _time_options_loaded(page):
         return True
 
-    # --- Attempt 2: Click calendar UI and navigate ---
     return _set_date_via_calendar(page, d)
 
 
@@ -289,13 +306,11 @@ def _set_date_via_calendar(page, d: date) -> bool:
         page.locator(_DATE_INPUT).click(timeout=3_000)
         page.wait_for_timeout(1_200)
 
-        # Navigate forward from today's month to d's month
         today = date.today()
         months = (d.year - today.year) * 12 + (d.month - today.month)
         for _ in range(months):
             for sel in ['.mbsc-cal-next', '.mbsc-fr-arr-r', '.mbsc-calendar-next',
-                        'button[aria-label*="next"]', 'button[aria-label*="次"]',
-                        'button:has-text("›")', 'button:has-text(">")']:
+                        'button[aria-label*="next"]', 'button[aria-label*="次"]']:
                 try:
                     btn = page.locator(sel).first
                     if btn.is_visible(timeout=400):
@@ -305,14 +320,9 @@ def _set_date_via_calendar(page, d: date) -> bool:
                 except Exception:
                     continue
 
-        # Click on the day cell
         day_str = str(d.day)
-        for sel in [
-            f'[data-val*="{d.isoformat()}"]',
-            f'[data-date="{d.isoformat()}"]',
-            '.mbsc-cal-day-i',
-            '.mbsc-calendar-day-text',
-        ]:
+        for sel in [f'[data-val*="{d.isoformat()}"]', f'[data-date="{d.isoformat()}"]',
+                    '.mbsc-cal-day-i', '.mbsc-calendar-day-text']:
             try:
                 if 'data-' in sel:
                     el = page.locator(sel).first
@@ -329,7 +339,6 @@ def _set_date_via_calendar(page, d: date) -> bool:
             except Exception:
                 continue
 
-        # Confirm/close
         for kw in ['Set', 'OK', '決定', '閉じる']:
             try:
                 btn = page.get_by_text(kw, exact=True).first
@@ -349,35 +358,19 @@ def _set_date_via_calendar(page, d: date) -> bool:
 
 
 def _time_options_loaded(page) -> bool:
-    """True when the time <select> has real options (AJAX populated it)."""
+    """True when the time <select> has real options populated by AJAX."""
     try:
         opts = page.locator(_TIME_SELECT + " option").all()
         real = [o for o in opts
                 if '--' not in (o.get_attribute('value') or '')
                 and (o.get_attribute('value') or '').strip()]
-        if real:
-            return True
+        return bool(real)
     except Exception:
-        pass
-    return False
-
-
-def _get_time_options(page) -> list[tuple[str, str]]:
-    """Return [(epoch_value, display_text)] for all real time options in the select."""
-    opts = []
-    try:
-        for opt in page.locator(_TIME_SELECT + " option").all():
-            v = (opt.get_attribute('value') or '').strip()
-            t = opt.inner_text().strip()
-            if v and '--' not in t and v:
-                opts.append((v, t))
-    except Exception:
-        pass
-    return opts
+        return False
 
 
 def _set_adults(page):
-    """Set adults to NUM_PEOPLE."""
+    """Set adults selector to NUM_PEOPLE."""
     try:
         page.locator(_ADULTS_SEL).select_option(str(NUM_PEOPLE), timeout=5_000)
         print(f"  ✓ adults set to {NUM_PEOPLE}")
@@ -385,174 +378,240 @@ def _set_adults(page):
         print(f"  ⚠ _set_adults: {e}")
 
 
-def _select_table_category(page):
-    """Click the first service-category radio (テーブル / table)."""
-    try:
-        radio = page.locator(_CAT_RADIO).first
-        if not radio.is_checked():
-            radio.click()
-    except Exception:
-        # Fallback: click テーブル text
+def _select_table_seat(page) -> bool:
+    """
+    Click the テーブル (table) seat type button — should highlight blue.
+    Tries multiple strategies since TableCheck renders this as custom UI.
+    """
+    strategies = [
+        # Exact text match on various element types
+        lambda: page.get_by_text("テーブル席", exact=True).first.click(),
+        lambda: page.get_by_text("テーブル", exact=True).first.click(),
+        # Radio/button with value containing "table"
+        lambda: page.locator('input[type="radio"][value*="table"]').first.evaluate("el => el.click()"),
+        lambda: page.locator('input[type="radio"]').nth(0).evaluate("el => el.click()"),
+        # Labeled elements
+        lambda: page.locator('label:has-text("テーブル")').first.click(),
+        lambda: page.locator('[class*="seat"]:has-text("テーブル")').first.click(),
+        lambda: page.locator('[class*="type"]:has-text("テーブル")').first.click(),
+    ]
+    for i, fn in enumerate(strategies):
         try:
-            page.get_by_text("テーブル", exact=False).first.click()
-        except Exception:
-            pass
-
-
-def _click_submit(page):
-    """Click the 確定画面へ submit button."""
-    try:
-        btn = page.locator(_SUBMIT)
-        if btn.is_visible(timeout=1_000):
-            print(f"    submit btn class={btn.get_attribute('class')}")
-            btn.click()
-            return
-    except Exception:
-        pass
-    for kw in ["確定画面へ", "Select", "選択", "次へ", "予約する"]:
-        try:
-            el = page.get_by_text(kw, exact=True).first
-            if el.is_visible():
-                el.click()
-                return
+            fn()
+            page.wait_for_timeout(500)
+            print(f"  ✓ テーブル selected (strategy {i})")
+            return True
         except Exception:
             continue
+    print("  ⚠ テーブル seat type not found — dumping clickable elements:")
+    _dump_clickables(page)
+    return False
 
 
-def _check_result(page, url_before: str) -> str:
-    """Return 'available', 'unavailable', or 'unknown'."""
-    url_after = page.url
-    print(f"    url_before={url_before[:60]}")
-    print(f"    url_after ={url_after[:60]}")
-
-    # Check error text first — 1500ms per check gives the orange banner time to render
-    for txt in UNAVAIL_TEXT:
-        try:
-            if page.get_by_text(txt, exact=False).first.is_visible(timeout=1_500):
-                print(f"    error text found: {txt!r}")
-                return "unavailable"
-        except Exception:
-            continue
-
-    # URL changed → navigated away from the reserve form → available
-    if url_after != url_before:
-        print("    URL changed — checking for confirmation keywords")
-        if any(kw in url_after for kw in ("confirm", "booking", "step2", "complete", "new")):
-            return "available"
-        # URL changed without a known keyword — check for confirmation text
-        for txt in ["予約確認", "確認ページ", "Reservation Confirmation"]:
+def _select_dinner_plan(page) -> bool:
+    """
+    Click the ディナー (dinner) plan card — should highlight green.
+    This appears after selecting テーブル seat type.
+    """
+    for keyword in ["ディナー", "Dinner", "テーブル席ディナー", "夜"]:
+        strategies = [
+            lambda kw=keyword: page.get_by_text(kw, exact=True).first.click(),
+            lambda kw=keyword: page.get_by_text(kw, exact=False).first.click(),
+            lambda kw=keyword: page.locator(f'label:has-text("{kw}")').first.click(),
+            lambda kw=keyword: page.locator(f'[class*="plan"]:has-text("{kw}")').first.click(),
+            lambda kw=keyword: page.locator(f'[class*="course"]:has-text("{kw}")').first.click(),
+            lambda kw=keyword: page.locator(f'li:has-text("{kw}")').first.click(),
+        ]
+        for i, fn in enumerate(strategies):
             try:
-                if page.get_by_text(txt, exact=False).first.is_visible(timeout=500):
-                    return "available"
+                fn()
+                page.wait_for_timeout(500)
+                print(f"  ✓ dinner plan selected: {keyword!r} (strategy {i})")
+                return True
             except Exception:
                 continue
-        # URL changed, no error, no known confirmation text — treat as available
-        return "available"
 
-    # Same URL — check for confirmation text appearing via AJAX
-    for txt in ["予約確認", "確認ページ", "Reservation Confirmation"]:
+    print("  ⚠ ディナー plan not found — dumping clickable elements:")
+    _dump_clickables(page)
+    return False
+
+
+def _get_time_options(page) -> list[tuple[str, str]]:
+    """
+    Return [(epoch_value, display_text)] for time options ≥ MIN_HOUR.
+    Reads from the hidden time <select> which AJAX populates after date+plan selection.
+    """
+    opts = []
+    try:
+        for opt in page.locator(_TIME_SELECT + " option").all():
+            v = (opt.get_attribute('value') or '').strip()
+            t = opt.inner_text().strip()
+            if not v or '--' in t:
+                continue
+            m = re.match(r'(\d{1,2}):', t)
+            if m and int(m.group(1)) >= MIN_HOUR:
+                opts.append((v, t))
+    except Exception:
+        pass
+    return opts
+
+
+def _click_time_button(page, time_label: str) -> bool:
+    """Fallback: find and click a visible time button with this label."""
+    for selector in [
+        f'button:has-text("{time_label}")',
+        f'[role="button"]:has-text("{time_label}")',
+        f'[class*="time"]:has-text("{time_label}")',
+        f'[class*="slot"]:has-text("{time_label}")',
+        f'li:has-text("{time_label}")',
+    ]:
         try:
-            if page.get_by_text(txt, exact=False).first.is_visible(timeout=500):
-                return "available"
+            el = page.locator(selector).first
+            if el.is_visible(timeout=800):
+                el.click()
+                print(f"  ✓ clicked time button {time_label!r}")
+                return True
         except Exception:
             continue
+    return False
+
+
+def _check_popup(page) -> str:
+    """
+    After selecting a time, check the bottom popup for availability.
+    Returns 'available', 'unavailable', or 'unknown'.
+    """
+    # Try to find a popup/sheet/modal
+    popup_text = ""
+    popup_found = False
+    for sel in [
+        '[role="dialog"]', '[role="alertdialog"]',
+        '[class*="modal"]', '[class*="popup"]',
+        '[class*="sheet"]', '[class*="bottom"]',
+        '[class*="reservation-action"]', '[class*="booking"]',
+        '[class*="reserve"]',
+    ]:
+        try:
+            popup = page.locator(sel).first
+            if popup.is_visible(timeout=1_000):
+                popup_text = popup.inner_text(timeout=1_000)
+                print(f"  popup({sel}): {popup_text[:300]!r}")
+                popup_found = True
+                break
+        except Exception:
+            continue
+
+    if not popup_found:
+        # No distinct popup element found — check full body for error/confirmation text
+        try:
+            popup_text = page.inner_text("body", timeout=3_000)
+        except Exception:
+            popup_text = ""
+        print(f"  no popup — body[0:300]={popup_text[:300]!r}")
+
+    # Check for unavailability
+    for txt in UNAVAIL_TEXT:
+        if txt in popup_text:
+            print(f"    → unavailable ({txt!r})")
+            return "unavailable"
+
+    # Check for booking confirmation (available)
+    for txt in AVAIL_TEXT:
+        if txt in popup_text:
+            print(f"    → available ({txt!r})")
+            return "available"
+
+    # If a popup element appeared but neither text matched — log and mark unknown
+    if popup_found:
+        print("    → popup appeared but no definitive text — unknown")
 
     return "unknown"
 
 
+def _dismiss_popup(page):
+    """Close any open popup/modal before trying the next time slot."""
+    for sel in [
+        'button[aria-label*="close"]', 'button[aria-label*="閉じ"]',
+        '[class*="close"]', 'button:has-text("閉じる")',
+        'button:has-text("×")', 'button:has-text("✕")', 'button:has-text("戻る")',
+    ]:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=400):
+                btn.click()
+                page.wait_for_timeout(400)
+                return
+        except Exception:
+            continue
+    # Fallback: Escape key
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
-# Debug helper
+# Debug helpers
 # ---------------------------------------------------------------------------
+
+def _dump_clickables(page):
+    """Print all visible clickable elements — used when seat/plan selection fails."""
+    try:
+        els = page.evaluate("""() => {
+            const out = [];
+            for (const el of document.querySelectorAll(
+                    'button, [role="button"], label, input[type="radio"], input[type="checkbox"], a, li, [class*="plan"], [class*="seat"], [class*="type"]')) {
+                const text = (el.innerText || el.textContent || '').trim().slice(0, 80);
+                const val  = el.value || '';
+                const cls  = (typeof el.className === 'string' ? el.className : '').slice(0, 80);
+                const vis  = el.offsetParent !== null;
+                if ((text || val) && vis) out.push({tag: el.tagName, text, val, cls});
+            }
+            return out.slice(0, 40);
+        }""")
+        for e in els:
+            print(f"    <{e['tag']}> text={e['text']!r} val={e['val']!r} cls={e['cls']!r}")
+    except Exception as ex:
+        print(f"    _dump_clickables error: {ex}")
+
 
 def _write_debug_summary(page, ds: str, note: str = ""):
     Path("debug").mkdir(exist_ok=True)
     lines = [f"**URL:** `{page.url}`", f"**Note:** {note}", ""]
 
-    elements = page.evaluate("""() => {
-        const out = [];
-        for (const el of document.querySelectorAll('*')) {
-            const text = (el.innerText || el.textContent || '').trim().slice(0, 100);
-            const val  = el.value !== undefined ? String(el.value) : '';
-            if (!text && !val) continue;
-            out.push({
-                tag: el.tagName.toLowerCase(),
-                id:  el.id || '',
-                cls: (typeof el.className === 'string') ? el.className.slice(0,100) : '',
-                role: el.getAttribute('role') || '',
-                type: el.getAttribute('type') || '',
-                name: el.getAttribute('name') || '',
-                ariaLabel: el.getAttribute('aria-label') || '',
-                text: text, val: val.slice(0, 60),
-            });
-        }
-        return out;
-    }""")
-
-    lines.append("### Page HTML (first 5000 chars of <body>)")
+    lines.append("### Visible clickable elements")
     try:
-        html = page.evaluate("() => document.body.innerHTML.slice(0, 5000)")
-        lines.append(f"```html\n{html}\n```")
-    except Exception as exc:
-        lines.append(f"_(error: {exc})_")
-    lines.append("")
+        els = page.evaluate("""() => {
+            const out = [];
+            for (const el of document.querySelectorAll(
+                    'button, [role="button"], label, input[type="radio"], input[type="checkbox"], select, a')) {
+                const text = (el.innerText || el.textContent || '').trim().slice(0, 100);
+                const val  = el.value || '';
+                const cls  = (typeof el.className === 'string' ? el.className : '').slice(0, 100);
+                const name = el.name || '';
+                const vis  = el.offsetParent !== null;
+                if (vis) out.push({tag: el.tagName, text, val, cls, name});
+            }
+            return out.slice(0, 60);
+        }""")
+        for e in els:
+            lines.append(f"- `<{e['tag']}>` name=`{e['name']}` val=`{e['val']}` text=`{e['text']}` cls=`{e['cls']}`")
+    except Exception as ex:
+        lines.append(f"_(error: {ex})_")
 
-    time_els = [e for e in elements
-                if re.search(r'\b\d{1,2}:\d{2}\b', e['text'] + ' ' + e['val'])]
-    lines.append(f"### Elements with time-like value ({len(time_els)})")
-    for e in time_els:
-        lines.append(f"- `<{e['tag']}>` name=`{e['name']}` type=`{e['type']}` "
-                     f"val=`{e['val']}` text=`{e['text']}` cls=`{e['cls']}`")
-    if not time_els:
-        lines.append("_(none)_")
     lines.append("")
-
-    lines.append("### Select elements")
-    found = False
-    for sel_el in page.locator("select").all():
-        try:
-            name = sel_el.get_attribute("name") or "?"
-            opts = [(o.get_attribute("value") or "", o.inner_text().strip())
-                    for o in sel_el.locator("option").all()]
-            lines.append(f"- `{name}`: {opts[:30]}")
-            found = True
-        except Exception:
-            continue
-    if not found:
-        lines.append("_(none)_")
-    lines.append("")
-
-    lines.append("### Input elements")
-    found = False
-    for el in page.locator("input").all():
-        try:
-            name = el.get_attribute("name") or el.get_attribute("id") or "?"
-            typ  = el.get_attribute("type") or "text"
-            val  = el.input_value() or ""
-            aria = el.get_attribute("aria-label") or ""
-            cls  = (el.get_attribute("class") or "")[:80]
-            lines.append(f"- `{name}` type=`{typ}` val=`{val}` aria=`{aria}` cls=`{cls}`")
-            found = True
-        except Exception:
-            continue
-    if not found:
-        lines.append("_(none)_")
-    lines.append("")
-
-    lines.append("### Buttons")
-    for el in page.locator("button, [role='button'], input[type='submit']").all():
-        try:
-            bt  = el.inner_text(timeout=200).strip() or el.get_attribute("value") or ""
-            cls = (el.get_attribute("class") or "")[:100]
-            aria = el.get_attribute("aria-label") or ""
-            if bt or aria:
-                lines.append(f"- text=`{bt}` aria=`{aria}` cls=`{cls}`")
-        except Exception:
-            continue
+    lines.append("### Page body text (first 2000 chars)")
+    try:
+        body = page.inner_text("body", timeout=3_000)
+        lines.append(f"```\n{body[:2000]}\n```")
+    except Exception as ex:
+        lines.append(f"_(error: {ex})_")
 
     content = "\n".join(lines)
     Path(f"debug/{ds}_summary.md").write_text(content, encoding="utf-8")
     print(f"\n--- DEBUG {ds} ({note}) ---")
-    print(content[:3000])
+    print(content[:2000])
     print("--- END DEBUG ---\n")
 
 
@@ -562,7 +621,7 @@ def _write_debug_summary(page, ds: str, note: str = ""):
 
 def _format_comment(checked: dict, start: date, end: date) -> str:
     total_avail = sum(len(v["available"]) for v in checked.values())
-    lines = [f"## 🍕 {start} → {end} · {NUM_PEOPLE} adults, table service", ""]
+    lines = [f"## 🍕 {start} → {end} · {NUM_PEOPLE} adults · table dinner ({MIN_HOUR}:00+)", ""]
 
     if not checked:
         lines.append("⚠️ No dates were checked.")
@@ -585,7 +644,7 @@ def _format_comment(checked: dict, start: date, end: date) -> str:
 
 def _print_results(checked: dict):
     print(f"\n{'='*56}")
-    print(f"  RESULTS — {NUM_PEOPLE} adults, table, Pizza Marumo")
+    print(f"  RESULTS — {NUM_PEOPLE} adults, table dinner, Pizza Marumo")
     print(f"{'='*56}")
     if not checked:
         print("  No dates checked.")
