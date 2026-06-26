@@ -46,15 +46,23 @@ UNAVAIL_TEXT = [
     "予約ができません",
     "ご利用いただけません",
     "受付不可",
+    "空席がありません",
+    "ご予約いただけません",
 ]
 
-# Text that confirms the popup is a BOOKING CONFIRMATION (slot available)
+# Text that confirms a BOOKING CONFIRMATION button/popup (slot available)
+# Only checked inside specific action elements, NOT the whole body.
 AVAIL_TEXT = [
-    "予約する",       # "Make reservation"
     "予約を確定",     # "Confirm reservation"
     "ご予約を確認",   # "Confirm your reservation"
     "次のステップ",   # "Next step"
-    "進む",           # "Proceed"
+]
+
+# Text in the store notice panel — always present, never indicates availability
+NOTICE_MARKERS = [
+    "お店からのお知らせ",
+    "ご予約について",
+    "予約は2ヶ月先まで",
 ]
 
 
@@ -181,17 +189,32 @@ def run(start: date, end: date, headless: bool, output_path: str,
             for epoch_val, time_label in time_opts:
                 print(f"  trying {time_label}")
 
-                # Select the time — this should trigger the bottom popup
-                try:
-                    page.locator(_TIME_SELECT).select_option(value=epoch_val, timeout=5_000)
-                except Exception as e:
-                    print(f"  ⚠ could not select time: {e}")
-                    # Fallback: try clicking a time button with this label
-                    if not _click_time_button(page, time_label):
+                # Try clicking a VISUAL time tile first (the correct SPA interaction).
+                # select_option() on the hidden <select> sets the value but may not
+                # trigger the bottom popup — the SPA reacts to clicks on visible tiles.
+                visual_clicked = _click_time_button(page, time_label)
+                if visual_clicked:
+                    print(f"    clicked visual tile for {time_label}")
+                else:
+                    # Fall back to the hidden <select>
+                    try:
+                        page.locator(_TIME_SELECT).select_option(value=epoch_val, timeout=5_000)
+                        # Also fire jQuery change in case the SPA uses it
+                        page.evaluate(f"""() => {{
+                            const s = document.querySelector('{_TIME_SELECT}');
+                            if (s && window.$) $(s).trigger('change');
+                        }}""")
+                        # Only dump clickables on the FIRST time slot so we can
+                        # see what visual elements are available for time selection.
+                        if time_label == time_opts[0][1]:
+                            print("    (no visual time tile found — dumping clickables once)")
+                            _dump_clickables(page)
+                    except Exception as e:
+                        print(f"    ⚠ could not select time: {e}")
                         continue
 
                 # Wait for the popup to appear
-                page.wait_for_timeout(2_000)
+                page.wait_for_timeout(2_500)
 
                 if debug:
                     page.screenshot(path=f"debug/{ds}_{time_label.replace(':', '')}.png")
@@ -457,19 +480,23 @@ def _get_time_options(page) -> list[tuple[str, str]]:
 
 
 def _click_time_button(page, time_label: str) -> bool:
-    """Fallback: find and click a visible time button with this label."""
+    """Find and click a visible time tile/button with this label."""
     for selector in [
-        f'button:has-text("{time_label}")',
-        f'[role="button"]:has-text("{time_label}")',
         f'[class*="time"]:has-text("{time_label}")',
         f'[class*="slot"]:has-text("{time_label}")',
+        f'[class*="hour"]:has-text("{time_label}")',
+        f'[role="option"]:has-text("{time_label}")',
+        f'button:has-text("{time_label}")',
+        f'[role="button"]:has-text("{time_label}")',
         f'li:has-text("{time_label}")',
+        f'[class*="option"]:has-text("{time_label}")',
+        f'td:has-text("{time_label}")',
+        f'[class*="cell"]:has-text("{time_label}")',
     ]:
         try:
             el = page.locator(selector).first
-            if el.is_visible(timeout=800):
+            if el.is_visible(timeout=600):
                 el.click()
-                print(f"  ✓ clicked time button {time_label!r}")
                 return True
         except Exception:
             continue
@@ -478,50 +505,111 @@ def _click_time_button(page, time_label: str) -> bool:
 
 def _check_popup(page) -> str:
     """
-    After selecting a time, check the bottom popup for availability.
+    After selecting a time, check for the availability indicator.
     Returns 'available', 'unavailable', or 'unknown'.
+
+    The store notice panel (お店からのお知らせ) is always present and always
+    matches [class*="booking"] — we skip it by filtering on NOTICE_MARKERS.
+    The real availability feedback is either a toast/error element or an
+    action button that appears in response to the time selection.
     """
-    # Try to find a popup/sheet/modal
     popup_text = ""
     popup_found = False
+
+    # Iterate ALL elements for each selector — skip the store notice panel.
     for sel in [
-        '[role="dialog"]', '[role="alertdialog"]',
+        '[role="alertdialog"]', '[role="alert"]',
+        '[class*="toast"]', '[class*="snack"]', '[class*="flash"]',
+        '[class*="action-bar"]', '[class*="sticky"]',
+        '[class*="reserve-action"]', '[class*="reservation-action"]',
+        '[class*="footer-action"]', '[class*="booking-action"]',
+        '[role="dialog"]',
         '[class*="modal"]', '[class*="popup"]',
         '[class*="sheet"]', '[class*="bottom"]',
-        '[class*="reservation-action"]', '[class*="booking"]',
-        '[class*="reserve"]',
+        '[class*="booking"]', '[class*="reserve"]',
     ]:
         try:
-            popup = page.locator(sel).first
-            if popup.is_visible(timeout=1_000):
-                popup_text = popup.inner_text(timeout=1_000)
-                print(f"  popup({sel}): {popup_text[:300]!r}")
-                popup_found = True
-                break
+            for popup in page.locator(sel).all():
+                if not popup.is_visible(timeout=300):
+                    continue
+                text = popup.inner_text(timeout=300)
+                if any(m in text for m in NOTICE_MARKERS):
+                    continue  # This is the store notice, not an availability indicator
+                if text.strip():
+                    popup_text = text
+                    print(f"  popup({sel}): {popup_text[:300]!r}")
+                    popup_found = True
+                    break
         except Exception:
             continue
+        if popup_found:
+            break
 
+    # Look for a visible "next / proceed" button — strong available signal.
+    # Check BEFORE body fallback since the button might live inside the page form.
     if not popup_found:
-        # No distinct popup element found — check full body for error/confirmation text
-        try:
-            popup_text = page.inner_text("body", timeout=3_000)
-        except Exception:
-            popup_text = ""
-        print(f"  no popup — body[0:300]={popup_text[:300]!r}")
+        for sel in [
+            'button:has-text("次へ")', 'a:has-text("次へ")',
+            'button:has-text("進む")',
+            '[class*="next-btn"]:not([disabled])',
+            '[class*="proceed"]:not([disabled])',
+        ]:
+            try:
+                btn = page.locator(sel).first
+                if btn.is_visible(timeout=300) and btn.is_enabled(timeout=300):
+                    print(f"    → available (next button visible: {sel})")
+                    return "available"
+            except Exception:
+                continue
 
-    # Check for unavailability
+    # Full-body fallback — use JS to skip the notice panel text.
+    if not popup_found:
+        try:
+            popup_text = page.evaluate("""() => {
+                // Walk text nodes, skipping any ancestor that looks like the notice panel
+                const markers = ['お店からのお知らせ', 'ご予約について'];
+                const skip = new Set();
+                for (const m of markers) {
+                    for (const el of document.querySelectorAll('*')) {
+                        if ((el.innerText || '').includes(m)) {
+                            skip.add(el);
+                            break;
+                        }
+                    }
+                }
+                const parts = [];
+                const walker = document.createTreeWalker(
+                    document.body, NodeFilter.SHOW_TEXT
+                );
+                let node;
+                while ((node = walker.nextNode())) {
+                    let el = node.parentElement;
+                    let blocked = false;
+                    while (el) {
+                        if (skip.has(el)) { blocked = true; break; }
+                        el = el.parentElement;
+                    }
+                    if (!blocked) parts.push(node.textContent);
+                }
+                return parts.join(' ');
+            }""")
+        except Exception:
+            try:
+                popup_text = page.inner_text("body", timeout=3_000)
+            except Exception:
+                popup_text = ""
+        print(f"  body(no-notice)[0:300]={popup_text[:300]!r}")
+
+    # Evaluate text
     for txt in UNAVAIL_TEXT:
         if txt in popup_text:
             print(f"    → unavailable ({txt!r})")
             return "unavailable"
-
-    # Check for booking confirmation (available)
     for txt in AVAIL_TEXT:
         if txt in popup_text:
             print(f"    → available ({txt!r})")
             return "available"
 
-    # If a popup element appeared but neither text matched — log and mark unknown
     if popup_found:
         print("    → popup appeared but no definitive text — unknown")
 
