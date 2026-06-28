@@ -62,16 +62,11 @@ jobs:
           except Exception:
               print(0)
           ")
-
-          # Scheduled runs: only post when slots found.
-          # Manual runs: always post (useful for testing).
-          EVENT="${{ github.event_name }}"
-          if [ "$EVENT" != "workflow_dispatch" ] && [ "$SLOTS" -eq 0 ]; then
-            echo "No availability found — skipping issue comment for scheduled run."
-            exit 0
-          fi
+          echo "Available slots: $SLOTS"
 
           REPO="${{ github.repository }}"
+
+          # Find or create the tracking issue
           NUM=$(gh issue list \
             --repo "$REPO" \
             --search "Pizza Marumo Reservation Results in:title" \
@@ -95,6 +90,7 @@ jobs:
             } > notify.md
             gh issue comment "$NUM" --repo "$REPO" --body-file notify.md
           else
+            # Always post results so every run is visible in the issue
             gh issue comment "$NUM" --repo "$REPO" --body-file comment.md
           fi
 
