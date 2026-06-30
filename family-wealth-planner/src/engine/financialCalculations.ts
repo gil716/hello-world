@@ -25,6 +25,7 @@ const TAX_BRACKETS_MFJ = [
 ];
 
 const STANDARD_DEDUCTION_MFJ = 29200;
+const SS_WAGE_BASE = 168600;
 
 export function calculateFederalTax(taxableIncome: number): number {
   let tax = 0;
@@ -45,6 +46,13 @@ export function getMarginalRate(taxableIncome: number): number {
   return 0.10;
 }
 
+// Employee-only FICA: SS (6.2% up to wage base) + Medicare (1.45%) + Additional Medicare Tax (0.9% over $200k)
+function employeeFica(salary: number): number {
+  return Math.min(salary, SS_WAGE_BASE) * 0.062
+    + salary * 0.0145
+    + Math.max(0, salary - 200000) * 0.009;
+}
+
 export function calculateTaxAnalysis(
   profile: UserProfile,
   assets: Assets,
@@ -52,15 +60,18 @@ export function calculateTaxAnalysis(
 ): TaxAnalysis {
   const grossIncome = profile.salary + profile.annualBonus;
   const traditional401kContrib = profile.employee401kContribution;
-  const agiBeforeDeductions = grossIncome - traditional401kContrib;
-  const taxableIncome = Math.max(0, agiBeforeDeductions - STANDARD_DEDUCTION_MFJ);
+  const magi = grossIncome - traditional401kContrib;
+  // Traditional IRA deduction phases out above $123k MAGI when covered by employer plan (MFJ 2024)
+  const iraDeductible = magi < 123000;
+  const iraDeduction = iraDeductible ? (profile.age >= 50 ? 8000 : 7000) : 0;
+  const taxableIncome = Math.max(0, magi - iraDeduction - STANDARD_DEDUCTION_MFJ);
 
   const federalTax = calculateFederalTax(taxableIncome);
-  const ficaTax = Math.min(profile.salary, 168600) * 0.062 * 2 + profile.salary * 0.0145 * 2;
-  const effectiveRate = federalTax / grossIncome;
+  const fica = employeeFica(profile.salary);
+  const effectiveRate = (federalTax + fica) / Math.max(1, grossIncome);
   const marginalRate = getMarginalRate(taxableIncome);
 
-  const irmaaRisk = agiBeforeDeductions > 206000;
+  const irmaaRisk = magi > 206000;
 
   const yearsToRmd = Math.max(0, 73 - profile.age);
   const traditionalAtRmd = (assets.traditionalIRA + assets.k401) *
@@ -77,7 +88,7 @@ export function calculateTaxAnalysis(
   return {
     federalTax,
     stateTax: 0,
-    ficaTax,
+    ficaTax: fica,
     effectiveRate,
     marginalRate,
     taxableIncome,
@@ -90,7 +101,7 @@ export function calculateTaxAnalysis(
 }
 
 export function calculateHealthcareCost(age: number, healthcareType: string): number {
-  if (age >= 65) return 6000;
+  if (age >= 65) return 8500; // Medicare Part B + Part D + Medigap supplement
   if (healthcareType === 'ACA') {
     if (age < 55) return 12000;
     if (age < 60) return 18000;
@@ -101,7 +112,7 @@ export function calculateHealthcareCost(age: number, healthcareType: string): nu
 }
 
 function calculateMortgagePayment(principal: number, annualRate: number, years: number): number {
-  if (years <= 0 || annualRate === 0) return principal;
+  if (years <= 0 || annualRate === 0 || principal <= 0) return 0;
   const monthlyRate = annualRate / 12;
   const n = years * 12;
   return (principal * monthlyRate * Math.pow(1 + monthlyRate, n)) /
@@ -124,15 +135,19 @@ export function projectCashFlows(
   let cashBal = assets.cash;
   let college529 = assets.college529;
   let mortgageBalance = assets.mortgage;
+  const yearsOnMortgage = assets.mortgagePayoffYear - currentYear;
   const annualMortgagePayment = mortgageBalance > 0
-    ? calculateMortgagePayment(assets.mortgage, assets.mortgageRate / 100, assets.mortgagePayoffYear - currentYear)
+    ? calculateMortgagePayment(assets.mortgage, assets.mortgageRate / 100, yearsOnMortgage)
     : 0;
 
   const annualReturn = assumptions.expectedReturn / 100;
   const inflationRate = assumptions.inflationRate / 100;
 
-  const collegeYear2Start = currentYear + 2;
-  const annualCollegeCost = 35000;
+  // Support up to 2 children with college windows staggered 2 years apart
+  const numChildren = Math.min(profile.children, 2);
+  const annualCollegeCost = assumptions.collegeCostsOutOfPocket;
+  const college1Start = currentYear + 2;
+  const college2Start = college1Start + 2;
 
   for (let age = profile.age; age <= maxAge; age++) {
     const year = currentYear + (age - profile.age);
@@ -157,20 +172,26 @@ export function projectCashFlows(
     const healthcare = calculateHealthcareCost(age, profile.healthcareType) * inflFactor;
     const mortgage = (!mortgagePaid && mortgageBalance > 0) ? annualMortgagePayment : 0;
 
+    // College costs for up to 2 children, 4-year windows
     let collegeCost = 0;
-    if (year >= collegeYear2Start && year < collegeYear2Start + 4) {
-      collegeCost = annualCollegeCost * inflFactor;
-      const fromPlan = Math.min(college529, collegeCost);
+    const c1Active = numChildren >= 1 && year >= college1Start && year < college1Start + 4;
+    const c2Active = numChildren >= 2 && year >= college2Start && year < college2Start + 4;
+    const rawCollegeCost = (c1Active ? annualCollegeCost : 0) + (c2Active ? annualCollegeCost : 0);
+    if (rawCollegeCost > 0) {
+      const inflatedCost = rawCollegeCost * inflFactor;
+      const fromPlan = Math.min(college529, inflatedCost);
       college529 -= fromPlan;
-      collegeCost = Math.max(0, collegeCost - fromPlan);
+      collegeCost = Math.max(0, inflatedCost - fromPlan);
     }
 
+    // Amortize mortgage balance
     if (!mortgagePaid && mortgageBalance > 0) {
       const interestPayment = mortgageBalance * (assets.mortgageRate / 100);
       const principalPayment = Math.min(mortgageBalance, annualMortgagePayment - interestPayment);
       mortgageBalance = Math.max(0, mortgageBalance - principalPayment);
     }
 
+    // Apply investment growth first, then add contributions
     const traditionalGrowth = traditionalBal * annualReturn;
     const rothGrowth = rothBal * annualReturn;
     const taxableGrowth = taxableBal * annualReturn;
@@ -179,39 +200,44 @@ export function projectCashFlows(
     rothBal += rothContrib + hsaContrib + rothGrowth;
     taxableBal += taxableGrowth;
 
-    if (isRetired && rothConversionAmount > 0 && age < 73) {
-      const conversion = Math.min(rothConversionAmount, traditionalBal);
-      traditionalBal -= conversion;
-      rothBal += conversion;
-    }
-
     let taxes = 0;
     let withdrawals = 0;
+    let conversionThisYear = 0;
 
     if (isWorking) {
-      const taxableInc = Math.max(0, salary + bonus - contrib401k - iraContrib - STANDARD_DEDUCTION_MFJ);
-      // Employee-only FICA (employer share is not the employee's cost)
-      taxes = calculateFederalTax(taxableInc) + Math.min(salary, 168600) * 0.062 + salary * 0.0145;
+      // Traditional IRA not deductible at high MAGI (covered by employer 401k)
+      const magi = salary + bonus - contrib401k;
+      const iraDeductible = magi < 123000;
+      const iraDeduction = iraDeductible ? iraContrib : 0;
+      const taxableInc = Math.max(0, magi - iraDeduction - STANDARD_DEDUCTION_MFJ);
+      taxes = calculateFederalTax(taxableInc) + employeeFica(salary);
       const livingExpenses = profile.retirementSpendingBeforeSS * inflFactor;
       const surplus = salary + bonus - contrib401k - iraContrib - rothContrib - hsaContrib - taxes - healthcare - mortgage - collegeCost - livingExpenses;
       if (surplus > 0) taxableBal += surplus;
-      cashBal = assets.cash; // cash held flat as emergency fund during working years
+      cashBal = assets.cash; // hold cash flat as emergency fund during working years
     } else {
-      // Retirement: first estimate how much the portfolio needs to cover
+      // Roth conversion at start of retirement year, before withdrawal tax calc
+      if (rothConversionAmount > 0 && age < 73) {
+        conversionThisYear = Math.min(rothConversionAmount, traditionalBal);
+        traditionalBal -= conversionThisYear;
+        rothBal += conversionThisYear;
+      }
+
       const baseExpenses = spendingGoal + healthcare + mortgage + collegeCost;
-      const portfolioNeededEstimate = Math.max(0, baseExpenses - ssIncome);
+      const portfolioNeededPreTax = Math.max(0, baseExpenses - ssIncome);
 
-      // Estimate taxes: 85% of SS + most of traditional withdrawal is taxable
+      // Tax estimate: 85% of SS + estimated traditional withdrawal + Roth conversion all taxable
       const ssTaxable = hasSS ? ssIncome * 0.85 : 0;
-      const totalPortfolio = Math.max(1, traditionalBal + rothBal + taxableBal);
-      const traditionalFraction = Math.min(0.95, traditionalBal / totalPortfolio);
-      const estTraditionalWithdrawal = portfolioNeededEstimate * traditionalFraction;
-      const retirementTaxableInc = Math.max(0, ssTaxable + estTraditionalWithdrawal - STANDARD_DEDUCTION_MFJ);
-      taxes = calculateFederalTax(retirementTaxableInc);
+      const totalPool = Math.max(1, traditionalBal + rothBal + taxableBal);
+      const tradFrac = Math.min(0.85, traditionalBal / totalPool);
+      const estTradW = portfolioNeededPreTax * tradFrac;
+      const retTaxInc = Math.max(0, ssTaxable + estTradW + conversionThisYear - STANDARD_DEDUCTION_MFJ);
+      taxes = calculateFederalTax(retTaxInc);
 
-      const totalNeeded = Math.max(0, portfolioNeededEstimate + taxes);
+      const totalNeeded = Math.max(0, portfolioNeededPreTax + taxes);
       withdrawals = totalNeeded;
 
+      // Withdraw from taxable first, then traditional, then Roth
       if (taxableBal >= totalNeeded) {
         taxableBal -= totalNeeded;
       } else {
@@ -243,7 +269,7 @@ export function projectCashFlows(
       collegeCosts: collegeCost,
       socialSecurity: ssIncome,
       withdrawals,
-      rothConversion: isRetired ? Math.min(rothConversionAmount, traditionalBal) : 0,
+      rothConversion: conversionThisYear,
       investmentGrowth: traditionalGrowth + rothGrowth + taxableGrowth,
       endingBalance: traditionalBal + rothBal + taxableBal + cashBal,
       traditionalBalance: traditionalBal,
@@ -264,7 +290,7 @@ export function calculateNetWorth(assets: Assets): number {
 }
 
 export function calculateRetirementAssets(assets: Assets): number {
-  return assets.traditionalIRA + assets.k401 + assets.rothIRA + assets.hsa;
+  return assets.traditionalIRA + assets.k401 + assets.rothIRA + assets.hsa + assets.taxableBrokerage;
 }
 
 export function calculateFreedomNumber(
@@ -273,10 +299,10 @@ export function calculateFreedomNumber(
   inflationRate: number,
   returnRate: number
 ): number {
-  const netSpending = annualSpending - ssIncome;
-  const safeWithdrawalRate = returnRate - inflationRate;
-  const swr = Math.max(0.03, safeWithdrawalRate);
-  return netSpending / swr;
+  const netSpending = Math.max(0, annualSpending - ssIncome);
+  // Real return = nominal return minus inflation, minimum 2%
+  const realReturn = Math.max(0.02, (returnRate - inflationRate) / 100);
+  return netSpending / realReturn;
 }
 
 export function compareRetirementAges(

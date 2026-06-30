@@ -22,6 +22,12 @@ export function runMonteCarlo(
     return emptyResult();
   }
 
+  // Starting balance is the last pre-retirement year's ending balance (avoids double-counting year 1)
+  const firstRetirementIdx = baseCashFlows.findIndex(f => f.withdrawals > 0 || f.salary === 0);
+  const startingBalance = firstRetirementIdx > 0
+    ? baseCashFlows[firstRetirementIdx - 1].endingBalance
+    : retirementFlows[0].endingBalance;
+
   const endingWealth: number[] = [];
   const successCount = { count: 0 };
 
@@ -30,7 +36,7 @@ export function runMonteCarlo(
   const percentileTrackers: number[][] = Array.from({ length: yearCount }, () => []);
 
   for (let sim = 0; sim < simulations; sim++) {
-    let portfolio = retirementFlows[0].endingBalance;
+    let portfolio = startingBalance;
     let failed = false;
 
     for (let yi = 0; yi < retirementFlows.length; yi++) {
@@ -39,8 +45,8 @@ export function runMonteCarlo(
       const yearReturn = annualReturn + volatility * shock;
 
       portfolio = portfolio * (1 + yearReturn);
+      // withdrawals is already net of SS income — do not add SS again
       portfolio -= flow.withdrawals;
-      portfolio += flow.socialSecurity;
 
       if (portfolio < 0) {
         failed = true;
