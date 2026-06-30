@@ -1,12 +1,37 @@
 import { useMemo } from 'react';
-import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, Cell } from 'recharts';
+import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { useFinancialStore } from '../store/useFinancialStore';
 import { Card } from '../components/ui/Card';
 import { formatCurrency } from '../utils/formatters';
 import { calculateNetWorth } from '../engine/financialCalculations';
+import type { Assets } from '../types';
+
+// Defined outside component to preserve identity across re-renders (prevents focus loss on every keystroke)
+function AssetInput({ label, field, value, onChange }: {
+  label: string;
+  field: keyof Assets;
+  value: number;
+  onChange: (updates: Partial<Assets>) => void;
+}) {
+  return (
+    <div>
+      <label className="text-xs text-gray-400 uppercase tracking-wide">{label}</label>
+      <div className="flex items-center gap-1 mt-1">
+        <span className="text-gray-500 text-sm">$</span>
+        <input
+          type="number"
+          className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-white text-sm focus:border-blue-500 focus:outline-none"
+          value={value}
+          onChange={e => onChange({ [field]: Math.max(0, +e.target.value) })}
+          step={1000}
+        />
+      </div>
+    </div>
+  );
+}
 
 export function NetWorth() {
-  const { profile, assets, cashFlows, updateAssets } = useFinancialStore();
+  const { assets, cashFlows, updateAssets } = useFinancialStore();
 
   const netWorth = useMemo(() => calculateNetWorth(assets), [assets]);
 
@@ -26,27 +51,16 @@ export function NetWorth() {
     { label: 'Roth IRA', key: 'rothIRA' as const, value: assets.rothIRA, color: '#8b5cf6' },
     { label: 'HSA', key: 'hsa' as const, value: assets.hsa, color: '#a78bfa' },
     { label: 'Taxable Brokerage', key: 'taxableBrokerage' as const, value: assets.taxableBrokerage, color: '#10b981' },
-    { label: '529 College', key: 'college529' as const, value: assets.college529, color: '#34d399' },
+    { label: 'Company Equity', key: 'companyEquity' as const, value: assets.companyEquity, color: '#059669' },
+    { label: 'ESPP (BLK)', key: 'espp' as const, value: assets.espp, color: '#34d399' },
+    { label: '529 College', key: 'college529' as const, value: assets.college529, color: '#06b6d4' },
     { label: 'Cash', key: 'cash' as const, value: assets.cash, color: '#f59e0b' },
     { label: 'Home Value', key: 'homeValue' as const, value: assets.homeValue, color: '#f97316' },
     { label: 'Mortgage (liability)', key: 'mortgage' as const, value: -assets.mortgage, color: '#ef4444' },
   ];
 
-  const InputField = ({ label, field, value }: { label: string; field: keyof typeof assets; value: number }) => (
-    <div>
-      <label className="text-xs text-gray-400 uppercase tracking-wide">{label}</label>
-      <div className="flex items-center gap-1 mt-1">
-        <span className="text-gray-500 text-sm">$</span>
-        <input
-          type="number"
-          className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-white text-sm focus:border-blue-500 focus:outline-none"
-          value={value}
-          onChange={e => updateAssets({ [field]: Math.max(0, +e.target.value) })}
-          step={1000}
-        />
-      </div>
-    </div>
-  );
+  const investable = assets.traditionalIRA + assets.k401 + assets.rothIRA + assets.hsa
+    + assets.taxableBrokerage + assets.companyEquity + assets.espp + assets.cash;
 
   return (
     <div className="space-y-5">
@@ -60,7 +74,7 @@ export function NetWorth() {
           <div className="grid grid-cols-2 gap-4 text-right">
             <div>
               <p className="text-xs text-gray-400">Investable Assets</p>
-              <p className="text-lg font-bold text-white">{formatCurrency(assets.traditionalIRA + assets.k401 + assets.rothIRA + assets.hsa + assets.taxableBrokerage + assets.cash, true)}</p>
+              <p className="text-lg font-bold text-white">{formatCurrency(investable, true)}</p>
             </div>
             <div>
               <p className="text-xs text-gray-400">Home Equity</p>
@@ -81,7 +95,7 @@ export function NetWorth() {
                 <div key={c.label}>
                   <div className="flex justify-between text-xs mb-1">
                     <span className="text-gray-400">{c.label}</span>
-                    <span className={c.value < 0 ? 'text-red-400' : 'text-white'} style={{ color: c.value < 0 ? undefined : c.color }}>
+                    <span style={{ color: c.value < 0 ? '#ef4444' : c.color }}>
                       {c.value < 0 ? '-' : ''}{formatCurrency(Math.abs(c.value), true)}
                     </span>
                   </div>
@@ -126,15 +140,17 @@ export function NetWorth() {
       <Card className="p-5">
         <h3 className="text-sm font-semibold text-gray-300 mb-4">Update Asset Values</h3>
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
-          <InputField label="Traditional IRA" field="traditionalIRA" value={assets.traditionalIRA} />
-          <InputField label="401k" field="k401" value={assets.k401} />
-          <InputField label="Roth IRA" field="rothIRA" value={assets.rothIRA} />
-          <InputField label="HSA" field="hsa" value={assets.hsa} />
-          <InputField label="Taxable Brokerage" field="taxableBrokerage" value={assets.taxableBrokerage} />
-          <InputField label="529 College Savings" field="college529" value={assets.college529} />
-          <InputField label="Cash & Savings" field="cash" value={assets.cash} />
-          <InputField label="Home Value" field="homeValue" value={assets.homeValue} />
-          <InputField label="Mortgage Balance" field="mortgage" value={assets.mortgage} />
+          <AssetInput label="Traditional IRA" field="traditionalIRA" value={assets.traditionalIRA} onChange={updateAssets} />
+          <AssetInput label="401k" field="k401" value={assets.k401} onChange={updateAssets} />
+          <AssetInput label="Roth IRA" field="rothIRA" value={assets.rothIRA} onChange={updateAssets} />
+          <AssetInput label="HSA" field="hsa" value={assets.hsa} onChange={updateAssets} />
+          <AssetInput label="Taxable Brokerage" field="taxableBrokerage" value={assets.taxableBrokerage} onChange={updateAssets} />
+          <AssetInput label="Company Equity Plan" field="companyEquity" value={assets.companyEquity} onChange={updateAssets} />
+          <AssetInput label="ESPP (BLK shares)" field="espp" value={assets.espp} onChange={updateAssets} />
+          <AssetInput label="529 College Savings" field="college529" value={assets.college529} onChange={updateAssets} />
+          <AssetInput label="Cash & Savings" field="cash" value={assets.cash} onChange={updateAssets} />
+          <AssetInput label="Home Value" field="homeValue" value={assets.homeValue} onChange={updateAssets} />
+          <AssetInput label="Mortgage Balance" field="mortgage" value={assets.mortgage} onChange={updateAssets} />
         </div>
       </Card>
     </div>

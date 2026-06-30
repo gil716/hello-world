@@ -36,6 +36,7 @@ const DEFAULT_HOLDINGS: Holding[] = [
   { id: '26', ticker: 'BRSTX', name: 'BlackRock Active Stock', shares: 100, costBasis: 12000, marketValue: 16800, dividendYield: 1.2, expenseRatio: 0.75, taxLocation: 'Traditional', assetClass: 'US Equity' },
   { id: '27', ticker: 'MADVX', name: 'BlackRock Equity Dividend', shares: 200, costBasis: 8000, marketValue: 11600, dividendYield: 2.8, expenseRatio: 0.82, taxLocation: 'Traditional', assetClass: 'US Equity' },
   { id: '28', ticker: 'IWB', name: 'iShares Russell 1000', shares: 100, costBasis: 22000, marketValue: 29500, dividendYield: 1.1, expenseRatio: 0.15, taxLocation: 'Taxable', assetClass: 'US Equity' },
+  { id: '29', ticker: 'BLK', name: 'BlackRock Inc. (ESPP)', shares: 12.6, costBasis: 8820, marketValue: 11340, dividendYield: 2.8, expenseRatio: 0, taxLocation: 'Taxable', assetClass: 'US Equity' },
 ];
 
 const DEFAULT_PROFILE: UserProfile = {
@@ -64,6 +65,8 @@ const DEFAULT_ASSETS: Assets = {
   hsa: 74000,
   taxableBrokerage: 46000,
   college529: 303000,
+  companyEquity: 30000,
+  espp: 11340,
 };
 
 const DEFAULT_ASSUMPTIONS: RetirementAssumptions = {

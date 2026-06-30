@@ -131,7 +131,7 @@ export function projectCashFlows(
 
   let traditionalBal = assets.traditionalIRA + assets.k401;
   let rothBal = assets.rothIRA + assets.hsa;
-  let taxableBal = assets.taxableBrokerage;
+  let taxableBal = assets.taxableBrokerage + assets.companyEquity + assets.espp;
   let cashBal = assets.cash;
   let college529 = assets.college529;
   let mortgageBalance = assets.mortgage;
@@ -285,7 +285,8 @@ export function projectCashFlows(
 
 export function calculateNetWorth(assets: Assets): number {
   return assets.traditionalIRA + assets.k401 + assets.rothIRA + assets.hsa +
-    assets.taxableBrokerage + assets.college529 + assets.cash +
+    assets.taxableBrokerage + assets.companyEquity + assets.espp +
+    assets.college529 + assets.cash +
     assets.homeValue - assets.mortgage;
 }
 

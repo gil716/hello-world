@@ -24,6 +24,8 @@ export interface Assets {
   hsa: number;
   taxableBrokerage: number;
   college529: number;
+  companyEquity: number;
+  espp: number;
 }
 
 export interface RetirementAssumptions {
