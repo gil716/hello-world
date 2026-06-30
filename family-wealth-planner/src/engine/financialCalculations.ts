@@ -186,34 +186,42 @@ export function projectCashFlows(
     }
 
     let taxes = 0;
+    let withdrawals = 0;
+
     if (isWorking) {
       const taxableInc = Math.max(0, salary + bonus - contrib401k - iraContrib - STANDARD_DEDUCTION_MFJ);
-      taxes = calculateFederalTax(taxableInc) + Math.min(salary, 168600) * 0.062 * 2;
+      // Employee-only FICA (employer share is not the employee's cost)
+      taxes = calculateFederalTax(taxableInc) + Math.min(salary, 168600) * 0.062 + salary * 0.0145;
+      const livingExpenses = profile.retirementSpendingBeforeSS * inflFactor;
+      const surplus = salary + bonus - contrib401k - iraContrib - rothContrib - hsaContrib - taxes - healthcare - mortgage - collegeCost - livingExpenses;
+      if (surplus > 0) taxableBal += surplus;
+      cashBal = assets.cash; // cash held flat as emergency fund during working years
     } else {
-      const taxableInc = Math.max(0, ssIncome * 0.85 - STANDARD_DEDUCTION_MFJ);
-      taxes = calculateFederalTax(taxableInc);
-    }
+      // Retirement: first estimate how much the portfolio needs to cover
+      const baseExpenses = spendingGoal + healthcare + mortgage + collegeCost;
+      const portfolioNeededEstimate = Math.max(0, baseExpenses - ssIncome);
 
-    let withdrawals = 0;
-    if (isRetired) {
-      const totalExpenses = spendingGoal + healthcare + mortgage + collegeCost + taxes;
-      const netNeeded = Math.max(0, totalExpenses - ssIncome);
+      // Estimate taxes: 85% of SS + most of traditional withdrawal is taxable
+      const ssTaxable = hasSS ? ssIncome * 0.85 : 0;
+      const totalPortfolio = Math.max(1, traditionalBal + rothBal + taxableBal);
+      const traditionalFraction = Math.min(0.95, traditionalBal / totalPortfolio);
+      const estTraditionalWithdrawal = portfolioNeededEstimate * traditionalFraction;
+      const retirementTaxableInc = Math.max(0, ssTaxable + estTraditionalWithdrawal - STANDARD_DEDUCTION_MFJ);
+      taxes = calculateFederalTax(retirementTaxableInc);
 
-      if (taxableBal >= netNeeded) {
-        taxableBal -= netNeeded;
+      const totalNeeded = Math.max(0, portfolioNeededEstimate + taxes);
+      withdrawals = totalNeeded;
+
+      if (taxableBal >= totalNeeded) {
+        taxableBal -= totalNeeded;
       } else {
-        withdrawals = netNeeded;
         const fromTaxable = taxableBal;
         taxableBal = 0;
-        const fromTraditional = Math.min(traditionalBal, withdrawals - fromTaxable);
+        const fromTraditional = Math.min(traditionalBal, totalNeeded - fromTaxable);
         traditionalBal -= fromTraditional;
-        const fromRoth = Math.max(0, withdrawals - fromTaxable - fromTraditional);
+        const fromRoth = Math.max(0, totalNeeded - fromTaxable - fromTraditional);
         rothBal = Math.max(0, rothBal - fromRoth);
       }
-    } else {
-      const surplus = salary + bonus - contrib401k - iraContrib - rothContrib - hsaContrib - taxes - healthcare - mortgage - collegeCost - 80000;
-      if (surplus > 0) taxableBal += surplus;
-      cashBal = assets.cash;
     }
 
     const homeValue = assets.homeValue * Math.pow(1 + 0.03, age - profile.age);
