@@ -16,6 +16,7 @@ const PAGE_TITLES: Record<string, string> = {
   '/scenarios': 'Scenario Manager',
   '/decisions': 'Decision Center',
   '/cash-flow': 'Cash Flow Timeline',
+  '/year-by-year': 'Year by Year',
   '/ai-advisor': 'AI Advisor',
   '/settings': 'Settings',
 };

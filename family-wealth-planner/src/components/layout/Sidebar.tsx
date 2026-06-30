@@ -15,6 +15,7 @@ import {
   XMarkIcon,
   BoltIcon,
   ChartBarIcon,
+  TableCellsIcon,
 } from '@heroicons/react/24/outline';
 
 const navItems = [
@@ -29,6 +30,7 @@ const navItems = [
   { path: '/scenarios', label: 'Scenarios', icon: DocumentDuplicateIcon },
   { path: '/decisions', label: 'Decision Center', icon: BoltIcon },
   { path: '/cash-flow', label: 'Cash Flow', icon: ChartBarIcon },
+  { path: '/year-by-year', label: 'Year by Year', icon: TableCellsIcon },
   { path: '/ai-advisor', label: 'AI Advisor', icon: ChatBubbleLeftRightIcon },
   { path: '/settings', label: 'Settings', icon: Cog6ToothIcon },
 ];

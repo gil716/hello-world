@@ -11,6 +11,7 @@ import { Estate } from './pages/Estate';
 import { Scenarios } from './pages/Scenarios';
 import { Decisions } from './pages/Decisions';
 import { CashFlow } from './pages/CashFlow';
+import { YearByYear } from './pages/YearByYear';
 import { AIAdvisor } from './pages/AIAdvisor';
 import { Settings } from './pages/Settings';
 
@@ -30,6 +31,7 @@ export default function App() {
           <Route path="/scenarios" element={<Scenarios />} />
           <Route path="/decisions" element={<Decisions />} />
           <Route path="/cash-flow" element={<CashFlow />} />
+          <Route path="/year-by-year" element={<YearByYear />} />
           <Route path="/ai-advisor" element={<AIAdvisor />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>
