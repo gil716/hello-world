@@ -35,12 +35,14 @@ export function Dashboard() {
   const successProb = monteCarloResult?.probabilityOfSuccess ?? 0;
   const medianEstate = monteCarloResult?.medianEndingWealth ?? 0;
 
-  // Tax diversification
-  const totalRetirement = assets.traditionalIRA + assets.k401 + assets.rothIRA + assets.hsa + assets.taxableBrokerage + assets.cash;
+  // Tax diversification — HSA is triple-tax-advantaged, not Roth; company equity & ESPP are taxable
+  const totalRetirement = assets.traditionalIRA + assets.k401 + assets.rothIRA + assets.hsa
+    + assets.taxableBrokerage + assets.companyEquity + assets.espp + assets.cash;
   const taxDiversification = [
-    { name: 'Traditional', value: assets.traditionalIRA + assets.k401, color: '#3b82f6' },
-    { name: 'Roth', value: assets.rothIRA + assets.hsa, color: '#8b5cf6' },
-    { name: 'Taxable', value: assets.taxableBrokerage, color: '#10b981' },
+    { name: 'Traditional (pre-tax)', value: assets.traditionalIRA + assets.k401, color: '#3b82f6' },
+    { name: 'Roth (after-tax)', value: assets.rothIRA, color: '#8b5cf6' },
+    { name: 'HSA (triple tax-free)', value: assets.hsa, color: '#a78bfa' },
+    { name: 'Taxable', value: assets.taxableBrokerage + assets.companyEquity + assets.espp, color: '#10b981' },
     { name: 'Cash', value: assets.cash, color: '#f59e0b' },
   ];
 
