@@ -47,8 +47,8 @@ const DEFAULT_PROFILE: UserProfile = {
   annualBonus: 25000,
   employerMatch401k: 9000,
   employee401kContribution: 25000,
-  retirementSpendingBeforeSS: 150000,
-  retirementSpendingAfterSS: 110000,
+  retirementSpendingBeforeSS: 120000,
+  retirementSpendingAfterSS: 120000,
   healthcareType: 'ACA',
   riskProfile: 'flexible',
 };

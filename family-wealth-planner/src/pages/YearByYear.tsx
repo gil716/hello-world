@@ -16,10 +16,9 @@ export function YearByYear() {
 
   // Augment each cash flow row with derived fields
   const enriched = useMemo(() => cashFlows.map(f => {
-    const inflFactor = Math.pow(1 + assumptions.inflationRate / 100, f.age - profile.age);
-    // Living expenses: working = pre-retirement spending target; retired = back-out from withdrawals
+    // Living expenses: working = pre-retirement spending target (flat); retired = back-out from withdrawals
     const living = f.salary > 0
-      ? profile.retirementSpendingBeforeSS * inflFactor
+      ? profile.retirementSpendingBeforeSS
       : Math.max(0, f.withdrawals - f.taxes + f.socialSecurity - f.healthcareCosts - f.mortgagePayment - f.collegeCosts);
     // Savings contributions (working years only)
     const savings = f.salary > 0

@@ -5,7 +5,7 @@ export const SS_BENEFITS: SocialSecurityBenefit[] = [
   { claimAge: 65, monthlyBenefit: 5510, annualBenefit: 66114 },
   { claimAge: 66, monthlyBenefit: 5939, annualBenefit: 71262 },
   { claimAge: 67, monthlyBenefit: 6368, annualBenefit: 76410 },
-  { claimAge: 70, monthlyBenefit: 7911, annualBenefit: 94932 },
+  { claimAge: 70, monthlyBenefit: 7750, annualBenefit: 93000 },
 ];
 
 export function getSocialSecurityBenefit(claimAge: number): number {
@@ -102,11 +102,8 @@ export function calculateTaxAnalysis(
 
 export function calculateHealthcareCost(age: number, healthcareType: string): number {
   if (age >= 65) return 8500; // Medicare Part B + Part D + Medigap supplement
-  if (healthcareType === 'ACA') {
-    if (age < 55) return 12000;
-    if (age < 60) return 18000;
-    return 24000;
-  }
+  // Flat rates pre-Medicare — ACA premiums for a couple, no subsidy at this income level
+  if (healthcareType === 'ACA') return 20000;
   if (healthcareType === 'Employer') return 8000;
   return 15000;
 }
@@ -141,7 +138,6 @@ export function projectCashFlows(
     : 0;
 
   const annualReturn = assumptions.expectedReturn / 100;
-  const inflationRate = assumptions.inflationRate / 100;
 
   // Support up to 2 children with college windows staggered 2 years apart
   const numChildren = Math.min(profile.children, 2);
@@ -155,21 +151,21 @@ export function projectCashFlows(
     const isRetired = !isWorking;
     const hasSS = age >= assumptions.ssClaimAge;
     const mortgagePaid = year >= assets.mortgagePayoffYear;
-    const inflFactor = Math.pow(1 + inflationRate, age - profile.age);
 
-    const salary = isWorking ? profile.salary * inflFactor : 0;
-    const bonus = isWorking ? profile.annualBonus * inflFactor : 0;
+    // All values in flat nominal dollars — no inflation adjustment
+    const salary = isWorking ? profile.salary : 0;
+    const bonus = isWorking ? profile.annualBonus : 0;
     const contrib401k = isWorking ? profile.employee401kContribution : 0;
     const employerMatch = isWorking ? profile.employerMatch401k : 0;
     const iraContrib = isWorking && age < 73 ? (age >= 50 ? 8000 : 7000) : 0;
     const rothContrib = isWorking && age < 73 ? (age >= 50 ? 8000 : 7000) : 0;
     const hsaContrib = isWorking && age < 65 ? 8300 : 0;
-    const ssIncome = hasSS ? getSocialSecurityBenefit(assumptions.ssClaimAge) * inflFactor : 0;
+    const ssIncome = hasSS ? getSocialSecurityBenefit(assumptions.ssClaimAge) : 0;
 
     const spendingGoal = hasSS
-      ? profile.retirementSpendingAfterSS * inflFactor
-      : profile.retirementSpendingBeforeSS * inflFactor;
-    const healthcare = calculateHealthcareCost(age, profile.healthcareType) * inflFactor;
+      ? profile.retirementSpendingAfterSS
+      : profile.retirementSpendingBeforeSS;
+    const healthcare = calculateHealthcareCost(age, profile.healthcareType);
     const mortgage = (!mortgagePaid && mortgageBalance > 0) ? annualMortgagePayment : 0;
 
     // College costs for up to 2 children, 4-year windows
@@ -178,10 +174,9 @@ export function projectCashFlows(
     const c2Active = numChildren >= 2 && year >= college2Start && year < college2Start + 4;
     const rawCollegeCost = (c1Active ? annualCollegeCost : 0) + (c2Active ? annualCollegeCost : 0);
     if (rawCollegeCost > 0) {
-      const inflatedCost = rawCollegeCost * inflFactor;
-      const fromPlan = Math.min(college529, inflatedCost);
+      const fromPlan = Math.min(college529, rawCollegeCost);
       college529 -= fromPlan;
-      collegeCost = Math.max(0, inflatedCost - fromPlan);
+      collegeCost = Math.max(0, rawCollegeCost - fromPlan);
     }
 
     // Amortize mortgage balance
@@ -211,7 +206,7 @@ export function projectCashFlows(
       const iraDeduction = iraDeductible ? iraContrib : 0;
       const taxableInc = Math.max(0, magi - iraDeduction - STANDARD_DEDUCTION_MFJ);
       taxes = calculateFederalTax(taxableInc) + employeeFica(salary);
-      const livingExpenses = profile.retirementSpendingBeforeSS * inflFactor;
+      const livingExpenses = profile.retirementSpendingBeforeSS;
       const surplus = salary + bonus - contrib401k - iraContrib - rothContrib - hsaContrib - taxes - healthcare - mortgage - collegeCost - livingExpenses;
       if (surplus > 0) taxableBal += surplus;
       cashBal = assets.cash; // hold cash flat as emergency fund during working years
