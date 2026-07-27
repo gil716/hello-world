@@ -77,7 +77,7 @@ const DEFAULT_ASSUMPTIONS: RetirementAssumptions = {
   lifeExpectancy: 90,
   spouseLifeExpectancy: 92,
   legacyGoalPerDaughter: 2000000,
-  collegeCostsOutOfPocket: 35000,
+  collegeCostsOutOfPocket: 100000,
   ssClaimAge: 70,
 };
 
