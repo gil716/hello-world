@@ -1,8 +1,6 @@
 name: Check Reservations
 
 on:
-  schedule:
-    - cron: '0 * * * *'   # every hour at :00
   workflow_dispatch:
     inputs:
       start_date:
